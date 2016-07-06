@@ -298,6 +298,8 @@ struct RAMSrcPageRequest {
     RAMBlock *rb;
     hwaddr    offset;
     hwaddr    len;
+    hwaddr    consumed_offset;
+    uint8_t *pages_copy_addr;
 
     QSIMPLEQ_ENTRY(RAMSrcPageRequest) next_req;
 };
@@ -407,6 +409,7 @@ struct PageSearchStatus {
     unsigned long page;
     /* Set once we wrap around */
     bool         complete_round;
+    uint8_t *pages_copy;
 };
 typedef struct PageSearchStatus PageSearchStatus;
 
@@ -1944,7 +1947,12 @@ static int ram_save_page(RAMState *rs, PageSearchStatus *pss, bool last_stage)
     ram_addr_t offset = pss->page << TARGET_PAGE_BITS;
     ram_addr_t current_addr = block->offset + offset;
 
-    p = block->host + offset;
+    /* If we have a copy of this page, use the backup page first */
+    if (pss->pages_copy) {
+        p = pss->pages_copy;
+    } else {
+        p = block->host + offset;
+    }
     trace_ram_save_page(block->idstr, (uint64_t)offset, p);
 
     XBZRLE_cache_lock();
@@ -2169,7 +2177,9 @@ static bool find_dirty_block(RAMState *rs, PageSearchStatus *pss, bool *again)
  * @rs: current RAM state
  * @offset: used to return the offset within the RAMBlock
  */
-static RAMBlock *unqueue_page(RAMState *rs, ram_addr_t *offset)
+
+static RAMBlock *unqueue_page(RAMState *rs, ram_addr_t *offset,
+                              uint8_t **pages_copy_addr)
 {
     RAMBlock *block = NULL;
 
@@ -2183,6 +2193,8 @@ static RAMBlock *unqueue_page(RAMState *rs, ram_addr_t *offset)
                                 QSIMPLEQ_FIRST(&rs->src_page_requests);
         block = entry->rb;
         *offset = entry->offset;
+
+        *pages_copy_addr = entry->pages_copy_addr;
 
         if (entry->len > TARGET_PAGE_SIZE) {
             entry->len -= TARGET_PAGE_SIZE;
@@ -2214,9 +2226,11 @@ static bool get_queued_page(RAMState *rs, PageSearchStatus *pss)
     RAMBlock  *block;
     ram_addr_t offset;
     bool dirty;
+    uint8_t *pages_backup_addr = NULL;
 
     do {
-        block = unqueue_page(rs, &offset);
+        block = unqueue_page(rs, &offset, &pages_backup_addr);
+
         /*
          * We're sending this page, and since it's postcopy nothing else
          * will dirty it, and we must make sure it doesn't get sent again
@@ -2254,6 +2268,8 @@ static bool get_queued_page(RAMState *rs, PageSearchStatus *pss)
          */
         pss->block = block;
         pss->page = offset >> TARGET_PAGE_BITS;
+
+        pss->pages_copy = pages_backup_addr;
     }
 
     return !!block;
@@ -2294,7 +2310,8 @@ static void migration_page_queue_free(RAMState *rs)
  * @start: starting address from the start of the RAMBlock
  * @len: length (in bytes) to send
  */
-int ram_save_queue_pages(const char *rbname, ram_addr_t start, ram_addr_t len)
+
+int ram_save_queue_pages(const char *rbname, ram_addr_t start, ram_addr_t len, bool copy_pages)
 {
     RAMBlock *ramblock;
     RAMState *rs = ram_state;
@@ -2336,6 +2353,17 @@ int ram_save_queue_pages(const char *rbname, ram_addr_t start, ram_addr_t len)
     new_entry->rb = ramblock;
     new_entry->offset = start;
     new_entry->len = len;
+    if (copy_pages) {
+        /* Fix me: Better to realize a memory pool */
+        new_entry->pages_copy_addr = g_try_malloc0(len);
+
+        if (!new_entry->pages_copy_addr) {
+            error_report("%s: Failed to alloc memory", __func__);
+            return -1;
+        }
+
+        memcpy(new_entry->pages_copy_addr, ramblock_ptr(ramblock, start), len);
+    }
 
     memory_region_ref(ramblock->mr);
     qemu_mutex_lock(&rs->src_page_req_mutex);
@@ -2537,6 +2565,7 @@ static int ram_find_and_save_block(RAMState *rs, bool last_stage)
     pss.block = rs->last_seen_block;
     pss.page = rs->last_page;
     pss.complete_round = false;
+    pss.pages_copy = NULL;
 
     if (!pss.block) {
         pss.block = QLIST_FIRST_RCU(&ram_list.blocks);
@@ -3183,9 +3212,12 @@ static void ram_init_bitmaps(RAMState *rs)
     rcu_read_lock();
 
     ram_list_init_bitmaps();
-    memory_global_dirty_log_start();
-    migration_bitmap_sync_precopy(rs);
 
+    /* For snapshot, we don't need to enable global dirty log */
+    if (!migration_in_snapshot()) {
+        memory_global_dirty_log_start();
+        migration_bitmap_sync_precopy(rs);
+    }
     rcu_read_unlock();
     qemu_mutex_unlock_ramlist();
     qemu_mutex_unlock_iothread();

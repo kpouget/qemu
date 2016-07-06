@@ -27,6 +27,20 @@ struct PostcopyBlocktimeContext;
 
 #define  MIGRATION_RESUME_ACK_VALUE  (1)
 
+struct UserfaultState {
+    bool           have_fault_thread;
+    QemuThread     fault_thread;
+    QemuSemaphore  fault_thread_sem;
+    /* Set this when we want the fault thread to quit */
+    bool           fault_thread_quit;
+    /* For the kernel to send us notifications */
+    int       userfault_fd;
+    /* To notify the fault_thread to wake, e.g., when need to quit */
+    int       userfault_event_fd;
+    /* UFFDIO_REGISTER_MODE_MISSING or UFFDIO_REGISTER_MODE_WP*/
+    int       mode;
+};
+
 /* State for the incoming migration */
 struct MigrationIncomingState {
     QEMUFile *from_src_file;
@@ -44,17 +58,11 @@ struct MigrationIncomingState {
     bool           have_fault_thread;
     QemuThread     fault_thread;
     QemuSemaphore  fault_thread_sem;
-    /* Set this when we want the fault thread to quit */
-    bool           fault_thread_quit;
 
     bool           have_listen_thread;
     QemuThread     listen_thread;
     QemuSemaphore  listen_thread_sem;
 
-    /* For the kernel to send us notifications */
-    int       userfault_fd;
-    /* To notify the fault_thread to wake, e.g., when need to quit */
-    int       userfault_event_fd;
     QEMUFile *to_src_file;
     QemuMutex rp_mutex;    /* We send replies from multiple threads */
     /* RAMBlock of last request sent to source */
@@ -63,6 +71,8 @@ struct MigrationIncomingState {
     void     *postcopy_tmp_zero_page;
     /* PostCopyFD's for external userfaultfds & handlers of shared memory */
     GArray   *postcopy_remote_fds;
+
+    UserfaultState userfault_state;
 
     QEMUBH *bh;
 
@@ -189,6 +199,10 @@ struct MigrationState
     /* Flag set once the migration thread is running (and needs joining) */
     bool migration_thread_running;
 
+    UserfaultState userfault_state;
+
+    bool in_snapshot; /* for snapshot */
+
     /* Flag set once the migration thread called bdrv_inactivate_all */
     bool block_inactive;
 
@@ -254,16 +268,17 @@ void migrate_fd_error(MigrationState *s, const Error *error);
 
 void migrate_fd_connect(MigrationState *s, Error *error_in);
 
+
 bool migration_is_setup_or_active(int state);
 
 void migrate_init(MigrationState *s);
+bool migration_in_snapshot(void);
 bool migration_is_blocked(Error **errp);
 /* True if outgoing migration has entered postcopy phase */
 bool migration_in_postcopy(void);
 MigrationState *migrate_get_current(void);
 
 bool migrate_postcopy(void);
-
 bool migrate_release_ram(void);
 bool migrate_postcopy_ram(void);
 bool migrate_zero_blocks(void);

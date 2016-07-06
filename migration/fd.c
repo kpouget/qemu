@@ -17,16 +17,19 @@
 #include "qemu/osdep.h"
 #include "channel.h"
 #include "fd.h"
+#include "qapi/error.h"
 #include "migration.h"
 #include "monitor/monitor.h"
 #include "io/channel-util.h"
 #include "trace.h"
+#include "qemu/cutils.h"
+#include "migration/migration.h"
 
-
-void fd_start_outgoing_migration(MigrationState *s, const char *fdname, Error **errp)
+void fd_start_outgoing_migration(MigrationState *s, const char *fdname,
+                                int outfd, Error **errp)
 {
     QIOChannel *ioc;
-    int fd = monitor_get_fd(cur_mon, fdname, errp);
+    int fd = fdname ? monitor_get_fd(cur_mon, fdname, errp) : outfd;
     if (fd == -1) {
         return;
     }
@@ -43,6 +46,24 @@ void fd_start_outgoing_migration(MigrationState *s, const char *fdname, Error **
     object_unref(OBJECT(ioc));
 }
 
+void file_start_outgoing_migration(MigrationState *s, const char *filename,
+                                   Error **errp)
+{
+    int fd;
+
+    fd = qemu_open(filename, O_CREAT | O_TRUNC | O_WRONLY, S_IRUSR | S_IWUSR);
+    if (fd < 0) {
+        error_setg_errno(errp, errno, "Failed to open file: %s", filename);
+        return;
+    }
+    /* Fix me: just for test
+    *  we shouldn't use this to identify if we are do snapshot.
+    */
+    s->in_snapshot = true;
+    fd_start_outgoing_migration(s, NULL, fd, errp);
+}
+
+
 static gboolean fd_accept_incoming_migration(QIOChannel *ioc,
                                              GIOCondition condition,
                                              gpointer opaque)
@@ -52,12 +73,22 @@ static gboolean fd_accept_incoming_migration(QIOChannel *ioc,
     return G_SOURCE_REMOVE;
 }
 
-void fd_start_incoming_migration(const char *infd, Error **errp)
+void fd_start_incoming_migration(const char *infd, int fd, Error **errp)
 {
     QIOChannel *ioc;
-    int fd;
+    long in_fd;
+    int err;
 
-    fd = strtol(infd, NULL, 0);
+    if (infd) {
+        err = qemu_strtol(infd, NULL, 0, &in_fd);
+        if (err < 0) {
+            error_setg_errno(errp, -err, "Failed to convert string '%s'"
+                            " to number", infd);
+            return;
+        }
+        fd = (int)in_fd;
+    }
+
     trace_migration_fd_incoming(fd);
 
     ioc = qio_channel_new_fd(fd, errp);
@@ -71,4 +102,16 @@ void fd_start_incoming_migration(const char *infd, Error **errp)
                                fd_accept_incoming_migration,
                                NULL, NULL,
                                g_main_context_get_thread_default());
+}
+
+void file_start_incoming_migration(const char *filename, Error **errp)
+{
+    int fd;
+
+    fd = qemu_open(filename, O_RDONLY);
+    if (fd < 0) {
+        error_setg_errno(errp, errno, "Failed to open file:%s", filename);
+        return;
+    }
+    fd_start_incoming_migration(NULL, fd, NULL);
 }

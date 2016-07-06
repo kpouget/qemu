@@ -19,9 +19,12 @@
 #include "qemu/osdep.h"
 #include "exec/target_page.h"
 #include "migration.h"
+#include "migration/misc.h"
 #include "qemu-file.h"
 #include "savevm.h"
 #include "postcopy-ram.h"
+#include "migration.h"
+#include "migration/misc.h"
 #include "ram.h"
 #include "qapi/error.h"
 #include "qemu/notify.h"
@@ -314,6 +317,12 @@ static bool ufd_check_and_apply(int ufd, MigrationIncomingState *mis)
             return false;
         }
     }
+
+    if (!(supported_features & UFFD_FEATURE_PAGEFAULT_FLAG_WP)) {
+        error_report("Does not support write protect feature");
+        return false;
+    }
+
     return true;
 }
 
@@ -474,8 +483,9 @@ static int cleanup_range(RAMBlock *rb, void *opaque)
     void *host_addr = qemu_ram_get_host_addr(rb);
     ram_addr_t offset = qemu_ram_get_offset(rb);
     ram_addr_t length = qemu_ram_get_used_length(rb);
-    MigrationIncomingState *mis = opaque;
+    UserfaultState *us = opaque;
     struct uffdio_range range_struct;
+
     trace_postcopy_cleanup_range(block_name, host_addr, offset, length);
 
     /*
@@ -492,7 +502,7 @@ static int cleanup_range(RAMBlock *rb, void *opaque)
     range_struct.start = (uintptr_t)host_addr;
     range_struct.len = length;
 
-    if (ioctl(mis->userfault_fd, UFFDIO_UNREGISTER, &range_struct)) {
+    if (ioctl(us->userfault_fd, UFFDIO_UNREGISTER, &range_struct)) {
         error_report("%s: userfault unregister %s", __func__, strerror(errno));
 
         return -1;
@@ -529,6 +539,34 @@ static void postcopy_balloon_inhibit(bool state)
     }
 }
 
+int postcopy_ram_disable_notify(UserfaultState *us)
+{
+    if (us->have_fault_thread) {
+        Error *local_err = NULL;
+
+        /* Let the fault thread quit */
+        atomic_set(&us->fault_thread_quit, 1);
+        postcopy_fault_thread_notify(us);
+        trace_postcopy_ram_incoming_cleanup_join();
+        qemu_thread_join(&us->fault_thread);
+
+        if (postcopy_notify(POSTCOPY_NOTIFY_INBOUND_END, &local_err)) {
+            error_report_err(local_err);
+            return -1;
+        }
+
+        if (foreach_not_ignored_block(cleanup_range, us)) {
+            return -1;
+        }
+
+        trace_postcopy_ram_incoming_cleanup_closeuf();
+        close(us->userfault_fd);
+        close(us->userfault_event_fd);
+        us->have_fault_thread = false;
+    }
+    return 0;
+}
+
 /*
  * At the end of a migration where postcopy_ram_incoming_init was called.
  */
@@ -536,28 +574,8 @@ int postcopy_ram_incoming_cleanup(MigrationIncomingState *mis)
 {
     trace_postcopy_ram_incoming_cleanup_entry();
 
-    if (mis->have_fault_thread) {
-        Error *local_err = NULL;
-
-        /* Let the fault thread quit */
-        atomic_set(&mis->fault_thread_quit, 1);
-        postcopy_fault_thread_notify(mis);
-        trace_postcopy_ram_incoming_cleanup_join();
-        qemu_thread_join(&mis->fault_thread);
-
-        if (postcopy_notify(POSTCOPY_NOTIFY_INBOUND_END, &local_err)) {
-            error_report_err(local_err);
-            return -1;
-        }
-
-        if (foreach_not_ignored_block(cleanup_range, mis)) {
-            return -1;
-        }
-
-        trace_postcopy_ram_incoming_cleanup_closeuf();
-        close(mis->userfault_fd);
-        close(mis->userfault_event_fd);
-        mis->have_fault_thread = false;
+    if (postcopy_ram_disable_notify(&mis->userfault_state) < 0) {
+        return 0;
     }
 
     postcopy_balloon_inhibit(false);
@@ -626,6 +644,31 @@ int postcopy_ram_prepare_discard(MigrationIncomingState *mis)
     return 0;
 }
 
+static int ram_set_pages_wp(uint64_t page_addr,
+                            uint64_t size,
+                            bool remove,
+                            int uffd)
+{
+    struct uffdio_writeprotect wp_struct;
+
+    memset(&wp_struct, 0, sizeof(wp_struct));
+    wp_struct.range.start = (uint64_t)(uintptr_t)page_addr;
+    wp_struct.range.len = size;
+    if (remove) {
+        wp_struct.mode = UFFDIO_WRITEPROTECT_MODE_DONTWAKE;
+    } else {
+        wp_struct.mode = UFFDIO_WRITEPROTECT_MODE_WP;
+    }
+    if (ioctl(uffd, UFFDIO_WRITEPROTECT, &wp_struct)) {
+        int e = errno;
+        error_report("%s: %s  page_addr: 0x%lx",
+                     __func__, strerror(e), page_addr);
+
+        return -e;
+    }
+    return 0;
+}
+
 /*
  * Mark the given area of RAM as requiring notification to unwritten areas
  * Used as a  callback on foreach_not_ignored_block.
@@ -637,18 +680,21 @@ int postcopy_ram_prepare_discard(MigrationIncomingState *mis)
  */
 static int ram_block_enable_notify(RAMBlock *rb, void *opaque)
 {
-    MigrationIncomingState *mis = opaque;
+    UserfaultState *us = opaque;
     struct uffdio_register reg_struct;
+    int ret = 0;
 
     reg_struct.range.start = (uintptr_t)qemu_ram_get_host_addr(rb);
     reg_struct.range.len = qemu_ram_get_used_length(rb);
     reg_struct.mode = UFFDIO_REGISTER_MODE_MISSING;
+    reg_struct.mode = us->mode;
 
     /* Now tell our userfault_fd that it's responsible for this area */
-    if (ioctl(mis->userfault_fd, UFFDIO_REGISTER, &reg_struct)) {
+    if (ioctl(us->userfault_fd, UFFDIO_REGISTER, &reg_struct)) {
         error_report("%s userfault register: %s", __func__, strerror(errno));
         return -1;
     }
+
     if (!(reg_struct.ioctls & ((__u64)1 << _UFFDIO_COPY))) {
         error_report("%s userfault: Region doesn't support COPY", __func__);
         return -1;
@@ -657,7 +703,15 @@ static int ram_block_enable_notify(RAMBlock *rb, void *opaque)
         qemu_ram_set_uf_zeroable(rb);
     }
 
-    return 0;
+    /* We need to set the write permission for pages to enable kernel
+    * notify us.
+    */
+    if (us->mode == UFFDIO_REGISTER_MODE_WP) {
+        ret = ram_set_pages_wp(reg_struct.range.start, reg_struct.range.len,
+                               false, us->userfault_fd);
+    }
+
+    return ret;
 }
 
 int postcopy_wake_shared(struct PostCopyFD *pcfd,
@@ -867,25 +921,29 @@ static bool postcopy_pause_fault_thread(MigrationIncomingState *mis)
  */
 static void *postcopy_ram_fault_thread(void *opaque)
 {
-    MigrationIncomingState *mis = opaque;
+    UserfaultState *us = opaque;
     struct uffd_msg msg;
     int ret;
     size_t index;
     RAMBlock *rb = NULL;
+    MigrationIncomingState *mis = container_of(us, MigrationIncomingState,
+                                               userfault_state);
 
     trace_postcopy_ram_fault_thread_entry();
     rcu_register_thread();
     mis->last_rb = NULL; /* last RAMBlock we sent part of */
-    qemu_sem_post(&mis->fault_thread_sem);
+
+    trace_postcopy_ram_fault_thread_entry();
+    qemu_sem_post(&us->fault_thread_sem);
 
     struct pollfd *pfd;
     size_t pfd_len = 2 + mis->postcopy_remote_fds->len;
 
     pfd = g_new0(struct pollfd, pfd_len);
 
-    pfd[0].fd = mis->userfault_fd;
+    pfd[0].fd = us->userfault_fd;
     pfd[0].events = POLLIN;
-    pfd[1].fd = mis->userfault_event_fd;
+    pfd[1].fd = us->userfault_event_fd;
     pfd[1].events = POLLIN; /* Waiting for eventfd to go positive */
     trace_postcopy_ram_fault_thread_fds_core(pfd[0].fd, pfd[1].fd);
     for (index = 0; index < mis->postcopy_remote_fds->len; index++) {
@@ -933,12 +991,12 @@ static void *postcopy_ram_fault_thread(void *opaque)
             uint64_t tmp64 = 0;
 
             /* Consume the signal */
-            if (read(mis->userfault_event_fd, &tmp64, 8) != 8) {
+            if (read(us->userfault_event_fd, &tmp64, 8) != 8) {
                 /* Nothing obviously nicer than posting this error. */
                 error_report("%s: read() failed", __func__);
             }
 
-            if (atomic_read(&mis->fault_thread_quit)) {
+            if (atomic_read(&us->fault_thread_quit)) {
                 trace_postcopy_ram_fault_thread_quit();
                 break;
             }
@@ -946,7 +1004,7 @@ static void *postcopy_ram_fault_thread(void *opaque)
 
         if (pfd[0].revents) {
             poll_result--;
-            ret = read(mis->userfault_fd, &msg, sizeof(msg));
+            ret = read(us->userfault_fd, &msg, sizeof(msg));
             if (ret != sizeof(msg)) {
                 if (errno == EAGAIN) {
                     /*
@@ -1080,6 +1138,52 @@ retry:
                 }
             }
         }
+
+        if (us->mode == UFFDIO_REGISTER_MODE_MISSING) {
+            MigrationIncomingState *mis = container_of(us,
+                                                       MigrationIncomingState,
+                                                       userfault_state);
+
+            /*
+             * Send the request to the source - we want to request one
+             * of our host page sizes (which is >= TPS)
+             */
+            if (rb != mis->last_rb) {
+                mis->last_rb = rb;
+                migrate_send_rp_req_pages(mis, qemu_ram_get_idstr(rb),
+                                          rb_offset, qemu_ram_pagesize(rb));
+            } else {
+                /* Save some space */
+                migrate_send_rp_req_pages(mis, NULL,
+                                          rb_offset, qemu_ram_pagesize(rb));
+            }
+        } else { /* UFFDIO_REGISTER_MODE_WP */
+            MigrationState *ms = container_of(us, MigrationState,
+                                              userfault_state);
+            ret = ram_save_queue_pages(qemu_ram_get_idstr(rb), rb_offset,
+                                       qemu_ram_pagesize(rb), true);
+
+            if (ret < 0) {
+                error_report("%s: Save: %"PRIx64 " failed!",
+                             __func__, (uint64_t)msg.arg.pagefault.address);
+                break;
+            }
+
+            /* Note: In the setup process, snapshot_thread may modify VM's
+            * write-protected pages, we should not block it there, or there
+            * will be an deadlock error.
+            */
+            if (migration_in_setup(ms)) {
+                uint64_t host = msg.arg.pagefault.address;
+
+                host &= ~(qemu_ram_pagesize(rb) - 1);
+                ret = ram_set_pages_wp(host, getpagesize(), true,
+                                       us->userfault_fd);
+                if (ret < 0) {
+                    error_report("Remove page's write-protect failed");
+                }
+            }
+        }
     }
     rcu_unregister_thread();
     trace_postcopy_ram_fault_thread_exit();
@@ -1087,46 +1191,53 @@ retry:
     return NULL;
 }
 
-int postcopy_ram_enable_notify(MigrationIncomingState *mis)
+static
+int postcopy_ram_register_userfaults(UserfaultState *us, int mode)
 {
+    MigrationIncomingState *mis = container_of(us, MigrationIncomingState,
+                                               userfault_state);
+
     /* Open the fd for the kernel to give us userfaults */
-    mis->userfault_fd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
-    if (mis->userfault_fd == -1) {
+    us->userfault_fd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+    if (us->userfault_fd == -1) {
         error_report("%s: Failed to open userfault fd: %s", __func__,
                      strerror(errno));
         return -1;
     }
-
+    us->mode = mode;
     /*
      * Although the host check already tested the API, we need to
      * do the check again as an ABI handshake on the new fd.
      */
-    if (!ufd_check_and_apply(mis->userfault_fd, mis)) {
+    if (!ufd_check_and_apply(us->userfault_fd, mis)) {
         return -1;
     }
 
     /* Now an eventfd we use to tell the fault-thread to quit */
-    mis->userfault_event_fd = eventfd(0, EFD_CLOEXEC);
-    if (mis->userfault_event_fd == -1) {
+    us->userfault_event_fd = eventfd(0, EFD_CLOEXEC);
+    if (us->userfault_event_fd == -1) {
         error_report("%s: Opening userfault_event_fd: %s", __func__,
-                     strerror(errno));
-        close(mis->userfault_fd);
+                    strerror(errno));
+        close(us->userfault_fd);
         return -1;
     }
 
-    qemu_sem_init(&mis->fault_thread_sem, 0);
-    qemu_thread_create(&mis->fault_thread, "postcopy/fault",
-                       postcopy_ram_fault_thread, mis, QEMU_THREAD_JOINABLE);
-    qemu_sem_wait(&mis->fault_thread_sem);
-    qemu_sem_destroy(&mis->fault_thread_sem);
-    mis->have_fault_thread = true;
+    qemu_sem_init(&us->fault_thread_sem, 0);
+    qemu_thread_create(&us->fault_thread, "postcopy/fault",
+                       postcopy_ram_fault_thread, us, QEMU_THREAD_JOINABLE);
+    qemu_sem_wait(&us->fault_thread_sem);
+    qemu_sem_destroy(&us->fault_thread_sem);
+    us->have_fault_thread = true;
 
     /* Mark so that we get notified of accesses to unwritten areas */
-    if (foreach_not_ignored_block(ram_block_enable_notify, mis)) {
+    if (foreach_not_ignored_block(ram_block_enable_notify, us)) {
         error_report("ram_block_enable_notify failed");
         return -1;
     }
 
+    if (foreach_not_ignored_block(nhp_range, us)) {
+        return -1;
+    }
     /*
      * Ballooning can mark pages as absent while we're postcopying
      * that would cause false userfaults.
@@ -1137,6 +1248,15 @@ int postcopy_ram_enable_notify(MigrationIncomingState *mis)
 
     return 0;
 }
+
+int postcopy_ram_register_wp(UserfaultState *us) {
+    return postcopy_ram_register_userfaults(us, UFFDIO_REGISTER_MODE_WP);
+}
+
+int postcopy_ram_register_missing(UserfaultState *us) {
+    return postcopy_ram_register_userfaults(us, UFFDIO_REGISTER_MODE_MISSING);
+}
+
 
 static int qemu_ufd_copy_ioctl(int userfault_fd, void *host_addr,
                                void *from_addr, uint64_t pagesize, RAMBlock *rb)
@@ -1195,7 +1315,7 @@ int postcopy_place_page(MigrationIncomingState *mis, void *host, void *from,
      * which would be slightly cheaper, but we'd have to be careful
      * of the order of updating our page state.
      */
-    if (qemu_ufd_copy_ioctl(mis->userfault_fd, host, from, pagesize, rb)) {
+    if (qemu_ufd_copy_ioctl(mis->userfault_state.userfault_fd, host, from, pagesize, rb)) {
         int e = errno;
         error_report("%s: %s copy host: %p from: %p (size: %zd)",
                      __func__, strerror(e), host, from, pagesize);
@@ -1222,7 +1342,8 @@ int postcopy_place_page_zero(MigrationIncomingState *mis, void *host,
      * but it's not available for everything (e.g. hugetlbpages)
      */
     if (qemu_ram_is_uf_zeroable(rb)) {
-        if (qemu_ufd_copy_ioctl(mis->userfault_fd, host, NULL, pagesize, rb)) {
+        if (qemu_ufd_copy_ioctl(mis->userfault_state.userfault_fd, host, NULL,
+                                pagesize, rb)) {
             int e = errno;
             error_report("%s: %s zero host: %p",
                          __func__, strerror(e), host);
@@ -1314,7 +1435,13 @@ int postcopy_request_shared_page(struct PostCopyFD *pcfd, RAMBlock *rb,
     return -1;
 }
 
-int postcopy_ram_enable_notify(MigrationIncomingState *mis)
+int postcopy_ram_register_wp(UserfaultState *us)
+{
+    assert(0);
+    return -1;
+}
+
+int postcopy_ram_register_missing(UserfaultState *us)
 {
     assert(0);
     return -1;
@@ -1340,6 +1467,12 @@ void *postcopy_get_tmp_page(MigrationIncomingState *mis)
     return NULL;
 }
 
+
+int postcopy_ram_enable_notify(UserfaultState *us, int mode) {
+    assert(0);
+    return -1;
+}
+
 int postcopy_wake_shared(struct PostCopyFD *pcfd,
                          uint64_t client_addr,
                          RAMBlock *rb)
@@ -1347,11 +1480,17 @@ int postcopy_wake_shared(struct PostCopyFD *pcfd,
     assert(0);
     return -1;
 }
+
+int postcopy_ram_disable_notify(UserfaultState *us) {
+    assert(0);
+    return -1;
+}
+
 #endif
 
 /* ------------------------------------------------------------------------- */
 
-void postcopy_fault_thread_notify(MigrationIncomingState *mis)
+void postcopy_fault_thread_notify(UserfaultState *us)
 {
     uint64_t tmp64 = 1;
 
@@ -1359,7 +1498,7 @@ void postcopy_fault_thread_notify(MigrationIncomingState *mis)
      * Wakeup the fault_thread.  It's an eventfd that should currently
      * be at 0, we're going to increment it to 1
      */
-    if (write(mis->userfault_event_fd, &tmp64, 8) != 8) {
+    if (write(us->userfault_event_fd, &tmp64, 8) != 8) {
         /* Not much we can do here, but may as well report it */
         error_report("%s: incrementing failed: %s", __func__,
                      strerror(errno));
@@ -1490,5 +1629,30 @@ void postcopy_unregister_shared_ufd(struct PostCopyFD *pcfd)
             mis->postcopy_remote_fds = g_array_remove_index(pcrfds, i);
             return;
         }
+    }
+}
+
+static int ram_block_mlock(RAMBlock *rb, void *opaque)
+{
+    int ret;
+    ram_addr_t length = qemu_ram_get_used_length(rb);
+    void *host_addr = qemu_ram_get_host_addr(rb);
+
+    ret = mlock(host_addr, length);
+    if (ret < 0) {
+        error_report("%s mlock failed: %s", __func__, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+void qemu_mlock_all_memory(void)
+{
+    /* Users have configured mlock, so don't do it again */
+    if (enable_mlock) {
+        return;
+    }
+    if (foreach_not_ignored_block(ram_block_mlock, NULL)) {
+        error_report("mlock all VM's memory failed");
     }
 }

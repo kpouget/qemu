@@ -48,6 +48,10 @@
 #include "hw/boards.h"
 #include "monitor/monitor.h"
 #include "net/announce.h"
+#include "io/channel-tls.h"
+#include "hw/boards.h" /* Fix me: Remove this if we support snapshot for KVM */
+#include <linux/userfaultfd.h>
+
 
 #define MAX_THROTTLE  (32 << 20)      /* Migration transfer speed throttling */
 
@@ -364,7 +368,9 @@ void qemu_start_incoming_migration(const char *uri, Error **errp)
     } else if (strstart(uri, "unix:", &p)) {
         unix_start_incoming_migration(p, errp);
     } else if (strstart(uri, "fd:", &p)) {
-        fd_start_incoming_migration(p, errp);
+        fd_start_incoming_migration(p, -1, errp);
+    } else if (strstart(uri, "file:", &p)) {
+        file_start_incoming_migration(p, errp);
     } else {
         error_setg(errp, "unknown migration protocol: %s", uri);
     }
@@ -1674,6 +1680,13 @@ bool migration_is_idle(void)
     return false;
 }
 
+bool migration_in_snapshot(void)
+{
+    MigrationState *s = migrate_get_current();
+
+    return s->in_snapshot;
+}
+
 void migrate_init(MigrationState *s)
 {
     /*
@@ -1924,7 +1937,9 @@ void qmp_migrate(const char *uri, bool has_blk, bool blk,
     } else if (strstart(uri, "unix:", &p)) {
         unix_start_outgoing_migration(s, p, &local_err);
     } else if (strstart(uri, "fd:", &p)) {
-        fd_start_outgoing_migration(s, p, &local_err);
+        fd_start_outgoing_migration(s, p, -1, &local_err);
+    } else if (strstart(uri, "file:", &p)) {
+        file_start_outgoing_migration(s, p, &local_err);
     } else {
         error_setg(errp, QERR_INVALID_PARAMETER_VALUE, "uri",
                    "a valid migration protocol");
@@ -2263,7 +2278,7 @@ static void migrate_handle_rp_req_pages(MigrationState *ms, const char* rbname,
         return;
     }
 
-    if (ram_save_queue_pages(rbname, start, len)) {
+    if (ram_save_queue_pages(rbname, start, len, false)) {
         mark_source_rp_bad(ms);
     }
 }
@@ -3206,6 +3221,8 @@ static void *migration_thread(void *opaque)
          */
         qemu_savevm_send_postcopy_advise(s->to_dst_file);
     }
+    /* userfaultfd's write-protected capability need all pages to be exist */
+    qemu_mlock_all_memory();
 
     if (migrate_colo_enabled()) {
         /* Notify migration destination that we enable COLO */
@@ -3283,6 +3300,62 @@ static void *migration_thread(void *opaque)
     return NULL;
 }
 
+static void *snapshot_thread(void *opaque)
+{
+    MigrationState *ms = opaque;
+    bool old_vm_running = false;
+    QIOChannelBuffer *buffer = NULL;
+    int ret;
+
+    rcu_register_thread();
+
+    qemu_savevm_state_header(ms->to_dst_file);
+
+    qemu_mutex_lock_iothread();
+    qemu_system_wakeup_request(QEMU_WAKEUP_REASON_OTHER, NULL);
+    old_vm_running = runstate_is_running();
+    ret = global_state_store();
+    if (!ret) {
+        ret = vm_stop_force_state(RUN_STATE_SAVE_VM);
+        if (ret < 0) {
+            error_report("Failed to stop VM");
+            goto error;
+        }
+    }
+    postcopy_ram_register_wp(&ms->userfault_state);
+    buffer = qemu_save_device_buffer();
+
+    if (old_vm_running) {
+        vm_start();
+    }
+    qemu_mutex_unlock_iothread();
+
+    migrate_set_state(&ms->state, MIGRATION_STATUS_SETUP, MIGRATION_STATUS_ACTIVE);
+
+    trace_snapshot_thread_setup_complete();
+
+    /* Save VM's Live state, such as RAM */
+
+    qemu_save_buffer_file(ms, buffer);
+    ret = qemu_file_get_error(ms->to_dst_file);
+    if (ret < 0) {
+        migrate_set_state(&ms->state, MIGRATION_STATUS_ACTIVE, MIGRATION_STATUS_FAILED);
+    } else {
+        migrate_set_state(&ms->state, MIGRATION_STATUS_ACTIVE,
+                          MIGRATION_STATUS_COMPLETED);
+    }
+
+    postcopy_ram_disable_notify(&ms->userfault_state);
+
+    qemu_mutex_lock_iothread();
+    qemu_savevm_state_cleanup();
+    qemu_bh_schedule(ms->cleanup_bh);
+    qemu_mutex_unlock_iothread();
+error:
+    rcu_unregister_thread();
+    return NULL;
+}
+
 void migrate_fd_connect(MigrationState *s, Error *error_in)
 {
     int64_t rate_limit;
@@ -3338,8 +3411,15 @@ void migrate_fd_connect(MigrationState *s, Error *error_in)
         migrate_fd_cleanup(s);
         return;
     }
-    qemu_thread_create(&s->thread, "live_migration", migration_thread, s,
-                       QEMU_THREAD_JOINABLE);
+
+    if (!migration_in_snapshot()) {
+        qemu_thread_create(&s->thread, "live_migration", migration_thread, s,
+                           QEMU_THREAD_JOINABLE);
+    } else {
+       qemu_thread_create(&s->thread, "live_snapshot", snapshot_thread, s,
+                          QEMU_THREAD_JOINABLE);
+    }
+
     s->migration_thread_running = true;
 }
 

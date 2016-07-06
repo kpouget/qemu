@@ -10,6 +10,7 @@
 #include "qemu/bitmap.h"
 #include "qemu/uuid.h"
 #include "qom/object.h"
+#include "io/channel-buffer.h"
 
 /* vl.c */
 
@@ -80,6 +81,9 @@ extern bool machine_init_done;
 
 void qemu_add_machine_init_done_notifier(Notifier *notify);
 void qemu_remove_machine_init_done_notifier(Notifier *notify);
+
+QIOChannelBuffer *qemu_save_device_buffer(void);
+int qemu_save_buffer_file(MigrationState *s, QIOChannelBuffer *buffer);
 
 extern int autostart;
 

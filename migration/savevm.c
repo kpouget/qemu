@@ -60,6 +60,8 @@
 #include "qemu/bitmap.h"
 #include "net/announce.h"
 
+#define BUFFER_BASE_SIZE (4 * 1024 * 1024)
+
 const unsigned int postcopy_ram_discard_version = 0;
 
 /* Subcommands for QEMU_VM_COMMAND */
@@ -1248,11 +1250,8 @@ void qemu_savevm_state_complete_postcopy(QEMUFile *f)
     qemu_fflush(f);
 }
 
-int qemu_savevm_state_complete_precopy(QEMUFile *f, bool iterable_only,
-                                       bool inactivate_disks)
+static int qemu_savevm_section_end(QEMUFile *f, bool iterable_only)
 {
-    QJSON *vmdesc;
-    int vmdesc_len;
     SaveStateEntry *se;
     int ret;
     bool in_postcopy = migration_in_postcopy();
@@ -1261,10 +1260,6 @@ int qemu_savevm_state_complete_precopy(QEMUFile *f, bool iterable_only,
     if (precopy_notify(PRECOPY_NOTIFY_COMPLETE, &local_err)) {
         error_report_err(local_err);
     }
-
-    trace_savevm_state_complete_precopy();
-
-    cpu_synchronize_all_states();
 
     QTAILQ_FOREACH(se, &savevm_state.handlers, entry) {
         if (!se->ops ||
@@ -1292,10 +1287,16 @@ int qemu_savevm_state_complete_precopy(QEMUFile *f, bool iterable_only,
             return -1;
         }
     }
+    return 0;
+}
 
-    if (iterable_only) {
-        return 0;
-    }
+static int qemu_savevm_section_full(QEMUFile *f, bool inactivate_disks)
+{
+    QJSON *vmdesc;
+    int vmdesc_len;
+    SaveStateEntry *se;
+    int ret;
+    bool in_postcopy = migration_in_postcopy();
 
     vmdesc = qjson_new();
     json_prop_int(vmdesc, "page_size", qemu_target_page_size());
@@ -1354,6 +1355,33 @@ int qemu_savevm_state_complete_precopy(QEMUFile *f, bool iterable_only,
         qemu_put_buffer(f, (uint8_t *)qjson_get_str(vmdesc), vmdesc_len);
     }
     qjson_destroy(vmdesc);
+
+    qemu_fflush(f);
+    return 0;
+}
+
+int qemu_savevm_state_complete_precopy(QEMUFile *f, bool iterable_only,
+                                        bool inactivate_disks)
+{
+    int ret;
+
+    trace_savevm_state_complete_precopy();
+
+    cpu_synchronize_all_states();
+
+    ret = qemu_savevm_section_end(f, iterable_only);
+    if (ret < 0) {
+        return ret;
+    }
+
+    if (iterable_only) {
+        return 0;
+    }
+
+    ret = qemu_savevm_section_full(f, inactivate_disks);
+    if (ret < 0) {
+        return ret;
+    }
 
     qemu_fflush(f);
     return 0;
@@ -1813,7 +1841,7 @@ static int loadvm_postcopy_handle_listen(MigrationIncomingState *mis)
      * shouldn't be doing anything yet so don't actually expect requests
      */
     if (migrate_postcopy_ram()) {
-        if (postcopy_ram_enable_notify(mis)) {
+        if (postcopy_ram_register_missing(&mis->userfault_state)) {
             postcopy_ram_incoming_cleanup(mis);
             return -1;
         }
@@ -1821,7 +1849,6 @@ static int loadvm_postcopy_handle_listen(MigrationIncomingState *mis)
 
     if (postcopy_notify(POSTCOPY_NOTIFY_INBOUND_LISTEN, &local_err)) {
         error_report_err(local_err);
-        return -1;
     }
 
     if (mis->have_listen_thread) {
@@ -2330,7 +2357,7 @@ static bool postcopy_pause_incoming(MigrationIncomingState *mis)
                       MIGRATION_STATUS_POSTCOPY_PAUSED);
 
     /* Notify the fault thread for the invalidated file handle */
-    postcopy_fault_thread_notify(mis);
+    postcopy_fault_thread_notify(&mis->userfault_state);
 
     error_report("Detected IO failure for postcopy. "
                  "Migration paused.");
@@ -2849,4 +2876,26 @@ bool vmstate_check_only_migratable(const VMStateDescription *vmsd)
     }
 
     return !(vmsd && vmsd->unmigratable);
+}
+
+QIOChannelBuffer *qemu_save_device_buffer(void)
+{
+    QIOChannelBuffer *bioc;
+    QEMUFile *fb = NULL;
+
+    bioc = qio_channel_buffer_new(BUFFER_BASE_SIZE);
+    fb = qemu_fopen_channel_output(QIO_CHANNEL(bioc));
+    object_unref(OBJECT(bioc));
+
+    cpu_synchronize_all_states();
+    qemu_savevm_section_full(fb, false);
+    qemu_fflush(fb);
+    return bioc;
+}
+
+int qemu_save_buffer_file(MigrationState *s, QIOChannelBuffer *buffer)
+{
+    qemu_put_buffer(s->to_dst_file, buffer->data, buffer->usage);
+    qemu_fflush(s->to_dst_file);
+    return qemu_file_get_error(s->to_dst_file);
 }

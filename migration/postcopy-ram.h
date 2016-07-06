@@ -17,10 +17,16 @@
 bool postcopy_ram_supported_by_host(MigrationIncomingState *mis);
 
 /*
+ * Make all of RAM sensitive to write accesses and wire up anything
+ * necessary to deal with it.
+ */
+int postcopy_ram_register_wp(UserfaultState *us);
+
+/*
  * Make all of RAM sensitive to accesses to areas that haven't yet been written
  * and wire up anything necessary to deal with it.
  */
-int postcopy_ram_enable_notify(MigrationIncomingState *mis);
+int postcopy_ram_register_missing(UserfaultState *us);
 
 /*
  * Initialise postcopy-ram, setting the RAM to a state where we can go into
@@ -114,7 +120,7 @@ PostcopyState postcopy_state_get(void);
 /* Set the state and return the old state */
 PostcopyState postcopy_state_set(PostcopyState new_state);
 
-void postcopy_fault_thread_notify(MigrationIncomingState *mis);
+void postcopy_fault_thread_notify(UserfaultState *us);
 
 /*
  * To be called once at the start before any device initialisation
@@ -188,5 +194,9 @@ int postcopy_wake_shared(struct PostCopyFD *pcfd, uint64_t client_addr,
 /* Callback from shared fault handlers to ask for a page */
 int postcopy_request_shared_page(struct PostCopyFD *pcfd, RAMBlock *rb,
                                  uint64_t client_addr, uint64_t offset);
+
+int postcopy_ram_disable_notify(UserfaultState *us);
+
+void qemu_mlock_all_memory(void);
 
 #endif
