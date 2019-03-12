@@ -3,6 +3,7 @@
  *
  * Copyright (c) 2003-2008 Fabrice Bellard
  * Copyright (c) 2009-2015 Red Hat Inc
+ * Copyright (c) 2018 Virtual Open Systems
  *
  * Authors:
  *  Juan Quintela <quintela@redhat.com>
@@ -54,6 +55,7 @@
 #include "qemu/cutils.h"
 #include "io/channel-buffer.h"
 #include "io/channel-file.h"
+#include "io/channel-util.h"
 #include "sysemu/replay.h"
 #include "qjson.h"
 #include "migration/colo.h"
@@ -2292,6 +2294,11 @@ qemu_loadvm_section_part_end(QEMUFile *f, MigrationIncomingState *mis)
         return -EINVAL;
     }
 
+    if (!incoming_migration_is_last_increment() &&
+        strcmp(se->idstr, "ram") == 0) {
+        /* partial reloading: ram been found, skip the rest of this increment */
+        return -EINTR;
+    }
     return 0;
 }
 
@@ -2436,6 +2443,25 @@ out:
             goto retry;
         }
     }
+    return ret;
+}
+
+int loadvm_load_checkpoint(int checkpoint_number) {
+    Error *local_error;
+    int fd = file_get_checkpoint_fd(checkpoint_number);
+    QIOChannel *ioc = qio_channel_new_fd(fd, &local_error);
+    QEMUFile *cpt_f;
+    int ret;
+
+    if (!ioc) {
+        error_report_err(local_error);
+        return -EINVAL;
+    }
+
+    cpt_f = qemu_fopen_channel_input(ioc);
+    ret = qemu_loadvm_state(cpt_f);
+    qemu_fclose(cpt_f);
+
     return ret;
 }
 

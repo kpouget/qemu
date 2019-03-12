@@ -3,6 +3,7 @@
  *
  * Copyright (c) 2003-2008 Fabrice Bellard
  * Copyright (c) 2011-2015 Red Hat Inc
+ * Copyright (c) 2018 Virtual Open Systems
  *
  * Authors:
  *  Juan Quintela <quintela@redhat.com>
@@ -57,6 +58,10 @@
 #include "qemu/uuid.h"
 #include "savevm.h"
 #include "qemu/iov.h"
+#include <math.h>
+#include "vosys-internal.h"
+
+#define VOSYS_USE_SAVED_TO_DISK_CHECKSUM 1
 
 /***********************************************************/
 /* ram save/restore */
@@ -82,7 +87,18 @@ static inline bool is_zero_range(uint8_t *p, uint64_t size)
     return buffer_is_zero(p, size);
 }
 
+static inline
+uintptr_t ram_host_page_bits(void)
+{
+    return log2(qemu_host_page_size);
+}
+
 XBZRLECacheStats xbzrle_counters;
+
+
+int mmap_allocated = 0;
+int mmap_deallocated = 0;
+int mmap_alive = 0;
 
 /* struct contains XBZRLE cache and a static page
    used by the compression */
@@ -348,17 +364,57 @@ struct RAMState {
     uint64_t migration_dirty_pages;
     /* Protects modification of the bitmap and migration dirty pages */
     QemuMutex bitmap_mutex;
-    /* The RAMBlock used in the last src_page_requests */
+    /* The RAMBlock used in the last page_requests */
     RAMBlock *last_req_rb;
     /* Queue of outstanding page requests from the destination */
-    QemuMutex src_page_req_mutex;
-    QSIMPLEQ_HEAD(, RAMSrcPageRequest) src_page_requests;
+    QemuMutex page_req_mutex;
+    QSIMPLEQ_HEAD(, RAMSrcPageRequest) page_requests;
+    QSIMPLEQ_HEAD(, RAMSrcPageRequest) next_dirty_pages;
+
+#if VOSYS_USE_SAVED_TO_DISK_CHECKSUM == 1
+    unsigned int saved_to_disk_page_count;
+    unsigned int *saved_to_disk_page_checksum;
+    unsigned int saved_to_disk_size;
+    unsigned int ram_checksum;
+#endif
 };
 typedef struct RAMState RAMState;
 
 static RAMState *ram_state;
 
 static NotifierWithReturnList precopy_notifier_list;
+
+#if VOSYS_USE_SAVED_TO_DISK_CHECKSUM == 1
+static void checksum_page_saved(RAMState *rs, RAMBlock *rb,
+                                ram_addr_t offset, uint8_t *p) {
+    unsigned int *current_host = (unsigned int *) p;
+    unsigned int *checksum_p =
+                   &rs->saved_to_disk_page_checksum[offset >> TARGET_PAGE_BITS];
+    const char *block_name = qemu_ram_get_idstr(rb);
+
+    assert (block_name && !ramblock_is_ignored(rb));
+
+    /* Checksum only the main ram for now.  */
+    if (strcmp(block_name, "mach-virt.ram") != 0) {
+        return;
+    }
+
+    assert(offset >> TARGET_PAGE_BITS < rs->saved_to_disk_page_count);
+
+    rs->saved_to_disk_size += TARGET_PAGE_SIZE;
+    *checksum_p = 0;
+
+    if (!p) {
+        /* this is a zero page */
+        return;
+    }
+
+    while ((uint8_t *) current_host < (p + TARGET_PAGE_SIZE)) {
+        *checksum_p += *current_host;
+        current_host++;
+    }
+}
+#endif
 
 void precopy_infrastructure_init(void)
 {
@@ -462,6 +518,48 @@ static QemuCond decomp_done_cond;
 
 static bool do_compress_ram_page(QEMUFile *f, z_stream *stream, RAMBlock *block,
                                  ram_addr_t offset, uint8_t *source_buf);
+
+static
+int do_checksum(RAMBlock *rb, void *opaque)
+{
+    void *host_addr = qemu_ram_get_host_addr(rb);
+    unsigned int *current_host = host_addr;
+    ram_addr_t length = qemu_ram_get_used_length(rb);
+    unsigned int memory_chk = 0;
+#if 1
+    const char *block_name = qemu_ram_get_idstr(rb);
+
+    /* Checksum only the main ram for now.  */
+    if (!block_name || strcmp(block_name, "mach-virt.ram") != 0) {
+        return 0;
+    }
+#endif
+
+    while ((void*) current_host < (host_addr + length)) {
+        memory_chk += *current_host;
+        current_host++;
+    }
+
+    if (opaque != NULL) {
+        unsigned int *all_checksum = (unsigned int *)opaque;
+        *all_checksum += memory_chk;
+    }
+
+    return 0;
+}
+
+int ram_checksum_memory(void) {
+    unsigned int all_checksum = 0;
+    if (runstate_is_running()) {
+        error_report("The VM shouldn't be running when doing the memory checksum ...");
+    }
+    if (foreach_not_ignored_block(do_checksum, &all_checksum)) {
+        error_report("CHECKSUM computing failed");
+        return -1;
+    }
+
+    return all_checksum;
+}
 
 static void *do_data_compress(void *opaque)
 {
@@ -1592,6 +1690,109 @@ static int save_xbzrle_page(RAMState *rs, uint8_t **current_data,
     return 1;
 }
 
+#define ATOMIC_APPLY(_addr_in_map, _map, _val, _ret)                 \
+    do {                                                             \
+        unsigned long old_val;                                       \
+        unsigned long mask = BIT_MASK(_addr_in_map);                 \
+        unsigned long word = BIT_WORD(_addr_in_map);                 \
+        unsigned long *p = _map + word;                              \
+                                                                     \
+        if (_val == 0) /* clear */ {                                 \
+            old_val = atomic_fetch_and(p, ~mask) ;                   \
+        } else if (_val == 1) /* set */ {                            \
+            old_val = atomic_fetch_or(p, mask);                      \
+        } else /* test */{                                           \
+            old_val = *p;                                            \
+        }                                                            \
+        _ret = !!(old_val & mask);                                   \
+                                                                     \
+    } while(0)
+
+inline
+bool snapshot_bitmap_processing_lock_host_page(RAMBlock *rb,
+                                               ram_addr_t host_page)
+{
+    bool ret;
+
+    ATOMIC_APPLY(host_page, rb->snapshot.processing_map, 1, ret); /* set */
+
+    return !ret; /* true if lock was free */
+}
+
+inline
+bool snapshot_bitmap_processing_unlock_host_page(RAMBlock *rb,
+                                                 ram_addr_t host_page)
+{
+    bool ret;
+
+    ATOMIC_APPLY(host_page, rb->snapshot.processing_map, 0, ret); /* clear */
+
+    return ret; /* true if lock was held */
+}
+
+inline
+bool snapshot_bitmap_dirty(RAMBlock *rb, ram_addr_t target_page, int val)
+{
+    bool ret;
+
+    ATOMIC_APPLY(target_page, rb->snapshot.dirty_map, val, ret);
+
+    return ret;
+}
+
+static inline
+ram_addr_t snapshot_bitmap_find_unsent_page(RAMBlock *rb,
+                                            unsigned long start_target_page)
+{
+    unsigned long size = rb->used_length >> TARGET_PAGE_BITS;
+
+    return find_next_zero_bit(rb->snapshot.sent_map, size, start_target_page);
+}
+
+inline
+bool snapshot_bitmap_sent(RAMBlock *rb, ram_addr_t target_page, int val)
+{
+    bool ret;
+
+    ATOMIC_APPLY(target_page, rb->snapshot.sent_map, val, ret);
+
+    return ret;
+}
+
+inline
+void snapshot_bitmap_reset_sent(RAMBlock *rb, long val)
+{
+    unsigned long pages = rb->max_length >> TARGET_PAGE_BITS;
+
+    bitmap_set(rb->snapshot.sent_map, val, pages);
+}
+
+void snapshot_bitmap_reset_all_dirty(void)
+{
+    RAMBlock *rb;
+
+    RAMBLOCK_FOREACH_NOT_IGNORED(rb) {
+        unsigned long pages = rb->max_length >> TARGET_PAGE_BITS;
+
+        bitmap_clear(rb->snapshot.dirty_map, 0, pages);
+    }
+}
+
+static inline
+ram_addr_t snapshot_bitmap_find_dirty(RAMBlock *rb, ram_addr_t start_page)
+{
+    unsigned long size = rb->used_length >> TARGET_PAGE_BITS;
+    ram_addr_t next;
+
+    if (ramblock_is_ignored(rb)) {
+        return size;
+    }
+
+    next = find_next_bit(rb->snapshot.dirty_map, size, start_page);
+
+    return next;
+}
+
 /**
  * migration_bitmap_find_dirty: find the next dirty page from start
  *
@@ -1816,13 +2017,21 @@ static void migration_bitmap_sync_precopy(RAMState *rs)
  * @offset: offset inside the block for the page
  */
 static int save_zero_page_to_file(RAMState *rs, QEMUFile *file,
-                                  RAMBlock *block, ram_addr_t offset)
+                                  PageSearchStatus *pss)
 {
-    uint8_t *p = block->host + offset;
+    uint8_t *p;
     int len = 0;
+    ram_addr_t offset = pss->page << TARGET_PAGE_BITS;
+
+    if (pss->pages_copy) {
+        p = pss->pages_copy;
+    } else {
+        p = ramblock_ptr(pss->block, offset);
+    }
 
     if (is_zero_range(p, TARGET_PAGE_SIZE)) {
-        len += save_page_header(rs, file, block, offset | RAM_SAVE_FLAG_ZERO);
+        len += save_page_header(rs, file, pss->block,
+                                offset | RAM_SAVE_FLAG_ZERO);
         qemu_put_byte(file, 0);
         len += 1;
     }
@@ -1838,9 +2047,9 @@ static int save_zero_page_to_file(RAMState *rs, QEMUFile *file,
  * @block: block that contains the page we want to send
  * @offset: offset inside the block for the page
  */
-static int save_zero_page(RAMState *rs, RAMBlock *block, ram_addr_t offset)
+static int save_zero_page(RAMState *rs, PageSearchStatus *pss)
 {
-    int len = save_zero_page_to_file(rs, rs->f, block, offset);
+    int len = save_zero_page_to_file(rs, rs->f, pss);
 
     if (len) {
         ram_counters.duplicate++;
@@ -1920,6 +2129,9 @@ static int save_normal_page(RAMState *rs, RAMBlock *block, ram_addr_t offset,
     } else {
         qemu_put_buffer(rs->f, buf, TARGET_PAGE_SIZE);
     }
+#if VOSYS_USE_SAVED_TO_DISK_CHECKSUM == 1
+    checksum_page_saved(rs, block, offset, buf);
+#endif
     ram_counters.transferred += TARGET_PAGE_SIZE;
     ram_counters.normal++;
     return 1;
@@ -1947,11 +2159,16 @@ static int ram_save_page(RAMState *rs, PageSearchStatus *pss, bool last_stage)
     ram_addr_t offset = pss->page << TARGET_PAGE_BITS;
     ram_addr_t current_addr = block->offset + offset;
 
+    if (migration_in_snapshot()) {
+        /* Save pages immediately in checkpoint mode */
+        send_async = false;
+    }
+
     /* If we have a copy of this page, use the backup page first */
     if (pss->pages_copy) {
         p = pss->pages_copy;
     } else {
-        p = block->host + offset;
+        p = ramblock_ptr(block, offset);
     }
     trace_ram_save_page(block->idstr, (uint64_t)offset, p);
 
@@ -1994,8 +2211,13 @@ static bool do_compress_ram_page(QEMUFile *f, z_stream *stream, RAMBlock *block,
     uint8_t *p = block->host + (offset & TARGET_PAGE_MASK);
     bool zero_page = false;
     int ret;
+    PageSearchStatus pss = {
+        .block = block,
+        .page = offset >> TARGET_PAGE_BITS,
+        .pages_copy = NULL,
+    };
 
-    if (save_zero_page_to_file(rs, f, block, offset)) {
+    if (save_zero_page_to_file(rs, f, &pss)) {
         zero_page = true;
         goto exit;
     }
@@ -2124,7 +2346,12 @@ retry:
  */
 static bool find_dirty_block(RAMState *rs, PageSearchStatus *pss, bool *again)
 {
-    pss->page = migration_bitmap_find_dirty(rs, pss->block, pss->page);
+    if (migration_in_snapshot()) {
+        pss->page = snapshot_bitmap_find_dirty(pss->block, pss->page);
+    } else {
+        pss->page = migration_bitmap_find_dirty(rs, pss->block, pss->page);
+    }
+
     if (pss->complete_round && pss->block == rs->last_seen_block &&
         pss->page >= rs->last_page) {
         /*
@@ -2160,9 +2387,37 @@ static bool find_dirty_block(RAMState *rs, PageSearchStatus *pss, bool *again)
         *again = true;
         return false;
     } else {
+        bool was_dirty = snapshot_bitmap_dirty(pss->block, pss->page,
+                                               0 /* clear */);
+#if INCR_CHPT_SANITY_CHECKS == 1
+        if (!was_dirty) {
+            vosys_warning("%p WAS ALREADY CLEANED :(", (void *) pss->page);
+            abort();
+        }
+#endif
         /* Can go around again, but... */
         *again = true;
         /* We've found something so probably don't need to */
+
+        /* ... except if the page was marked as dirty between
+         * snapshot_bitmap_find_dirty and now.  */
+        if (!was_dirty) {
+            return false;
+        }
+
+        /* we also need exclusive access to the page.  Here, *we*
+         * marked the page as clean, so the fault-handler thread can
+         * only see is as clean. Hence, it will put it in the next
+         * dirty queue, without trying to lock it. Thus, we can safely take
+         * the lock.
+         * */
+        while (!snapshot_bitmap_processing_lock_host_page(pss->block, pss->page
+                                 >> (ram_host_page_bits() - TARGET_PAGE_BITS))) {
+            usleep(100);
+            vosys_warning("THE LOCK ON PAGE %p WAS EXPECTED TO BE ALWAYS FREE",
+                          (void *) pss->page);
+        }
+
         return true;
     }
 }
@@ -2182,31 +2437,74 @@ static RAMBlock *unqueue_page(RAMState *rs, ram_addr_t *offset,
                               uint8_t **pages_copy_addr)
 {
     RAMBlock *block = NULL;
+    static struct RAMSrcPageRequest *queue_entry_to_free;
 
-    if (QSIMPLEQ_EMPTY_ATOMIC(&rs->src_page_requests)) {
-        return NULL;
+    qemu_mutex_lock(&rs->page_req_mutex);
+
+    if (queue_entry_to_free) {
+        /* Housekeeping for the previous call ... */
+
+        if (queue_entry_to_free->pages_copy_addr) {
+#if VOSYS_TRY_MMAP_SHADOW_COPY == 1
+            munmap(queue_entry_to_free->pages_copy_addr, 4096);
+            int diff = mmap_allocated-mmap_deallocated;
+            mmap_alive = mmap_alive > diff ? mmap_alive : diff;
+            mmap_deallocated++;
+#else
+            g_free(queue_entry_to_free->pages_copy_addr);
+#endif
+            queue_entry_to_free->pages_copy_addr = NULL;
+        }
+        g_free(queue_entry_to_free);
+        queue_entry_to_free = NULL;
     }
 
-    qemu_mutex_lock(&rs->src_page_req_mutex);
-    if (!QSIMPLEQ_EMPTY(&rs->src_page_requests)) {
-        struct RAMSrcPageRequest *entry =
-                                QSIMPLEQ_FIRST(&rs->src_page_requests);
+    if (!QSIMPLEQ_EMPTY(&rs->page_requests)) {
+        struct RAMSrcPageRequest *entry = QSIMPLEQ_FIRST(&rs->page_requests);
+
         block = entry->rb;
-        *offset = entry->offset;
 
-        *pages_copy_addr = entry->pages_copy_addr;
+        *offset = entry->offset + entry->consumed_offset;
 
-        if (entry->len > TARGET_PAGE_SIZE) {
-            entry->len -= TARGET_PAGE_SIZE;
-            entry->offset += TARGET_PAGE_SIZE;
+        int sleep_time = 0;
+        while (!snapshot_bitmap_processing_lock_host_page(block,
+                                             *offset >> ram_host_page_bits())) {
+            usleep(100);
+            sleep_time++;
+        }
+
+        if (sleep_time) {
+            vosys_debug("WAITED %d*100us to get page %p processing lock",
+                        sleep_time, (void *) *offset);
+        }
+
+        /* we have the page processing lock, so this field won't be modified. */
+        if (entry->pages_copy_addr) {
+            *pages_copy_addr = entry->pages_copy_addr + entry->consumed_offset;
         } else {
+            *pages_copy_addr = NULL;
+        }
+
+        if ((entry->len - entry->consumed_offset) > TARGET_PAGE_SIZE) {
+            entry->consumed_offset += TARGET_PAGE_SIZE;
+
+        } else { /* the page has been fully consumed */
             memory_region_unref(block->mr);
-            QSIMPLEQ_REMOVE_HEAD(&rs->src_page_requests, next_req);
-            g_free(entry);
+
+            QSIMPLEQ_REMOVE_HEAD(&rs->page_requests, next_req);
+
+            /* We cannot free here as `entry->pages_copy_addr` is used
+               after the call to save the page content to disk. We
+               also cannot clean `entry` here, because
+               `ram_next_dirty_pages_to_priority_queue` should be able
+               to do it as well.  So clean them up at next call (the
+               queue has to be empty to finish the snapshot, so we
+               know they won't stay dangling). */
+            queue_entry_to_free = entry;
             migration_consume_urgent_request();
         }
     }
-    qemu_mutex_unlock(&rs->src_page_req_mutex);
+    qemu_mutex_unlock(&rs->page_req_mutex);
 
     return block;
 }
@@ -2224,12 +2522,12 @@ static RAMBlock *unqueue_page(RAMState *rs, ram_addr_t *offset,
 static bool get_queued_page(RAMState *rs, PageSearchStatus *pss)
 {
     RAMBlock  *block;
-    ram_addr_t offset;
-    bool dirty;
-    uint8_t *pages_backup_addr = NULL;
+    ram_addr_t offset = -1;
+    bool dirty = true;
+    uint8_t *pages_content_addr = NULL;
 
     do {
-        block = unqueue_page(rs, &offset, &pages_backup_addr);
+        block = unqueue_page(rs, &offset, &pages_content_addr);
 
         /*
          * We're sending this page, and since it's postcopy nothing else
@@ -2237,7 +2535,8 @@ static bool get_queued_page(RAMState *rs, PageSearchStatus *pss)
          * even if this queue request was received after the background
          * search already sent it.
          */
-        if (block) {
+        if (block && !migration_in_snapshot()) {
+            /* in snapshot migrations, we already know that the page is dirty */
             unsigned long page;
 
             page = offset >> TARGET_PAGE_BITS;
@@ -2266,10 +2565,10 @@ static bool get_queued_page(RAMState *rs, PageSearchStatus *pss)
          * since the guest is likely to want other pages near to the page
          * it just requested.
          */
+        assert (offset != -1);
         pss->block = block;
         pss->page = offset >> TARGET_PAGE_BITS;
-
-        pss->pages_copy = pages_backup_addr;
+        pss->pages_copy = pages_content_addr;
     }
 
     return !!block;
@@ -2290,12 +2589,159 @@ static void migration_page_queue_free(RAMState *rs)
      * migration might have some droppings in.
      */
     rcu_read_lock();
-    QSIMPLEQ_FOREACH_SAFE(mspr, &rs->src_page_requests, next_req, next_mspr) {
+
+    qemu_mutex_lock(&rs->page_req_mutex);
+    QSIMPLEQ_FOREACH_SAFE(mspr, &rs->page_requests, next_req, next_mspr) {
+        if (mspr->pages_copy_addr) {
+            error_report("migration: found a shadow copy not cleaned :(");
+        }
         memory_region_unref(mspr->rb->mr);
-        QSIMPLEQ_REMOVE_HEAD(&rs->src_page_requests, next_req);
+        QSIMPLEQ_REMOVE_HEAD(&rs->page_requests, next_req);
         g_free(mspr);
     }
+    qemu_mutex_unlock(&rs->page_req_mutex);
     rcu_read_unlock();
+}
+
+
+/* Assumes that the page_req_mutex is owned */
+bool ram_update_page_in_queue(const char *rbname, ram_addr_t offset, ram_addr_t size) {
+    bool found = false;
+    RAMState *rs = ram_state;
+    struct RAMSrcPageRequest *entry, *entry_next;
+
+    /* We cannot take the page_req_mutex here, as we have the page
+     * processing lock.  `unqueue_page` *must* take first the
+     * page_req_mutex, then the page processing lock, so that would
+     * create a deadlock.
+     */
+    QSIMPLEQ_FOREACH_SAFE(entry, &rs->page_requests, next_req, entry_next) {
+        if (entry->offset == offset && strcmp(rbname, entry->rb->idstr) == 0) {
+            QSIMPLEQ_REMOVE(&rs->page_requests, entry, RAMSrcPageRequest, next_req);
+            QSIMPLEQ_INSERT_HEAD(&rs->page_requests, entry, next_req);
+            found = true;
+            break;
+        }
+    }
+
+    if (!found) {
+        int i = 0;
+        error_report("ram_update_page_in_queue: page not found in the queue");
+        error_report("offset: 0x"RAM_ADDR_FMT", block: %s", offset, rbname);
+        QSIMPLEQ_FOREACH_SAFE(entry, &rs->page_requests, next_req, entry_next) {
+            error_report("    %d. offset: 0x"RAM_ADDR_FMT", block: %s", i, entry->offset, entry->rb->idstr);
+            i++;
+        }
+        return false;
+    }
+
+    RAMBlock *ramblock = rs->last_req_rb;
+    if (!ramblock) {
+        /*
+         * Shouldn't happen, we can't reuse the last RAMBlock if it's
+         * the 1st request.
+         */
+        error_report("ram_save_queue_pages no previous block");
+        return false;
+    }
+
+    if (entry->pages_copy_addr != NULL) {
+        error_report("%s: Copy of page "RAM_ADDR_FMT" already taken ... I discard it.",
+                     __func__, offset);
+        return false;
+    }
+
+    /* see also in ram_save_queue_pages */
+#if VOSYS_TRY_MMAP_SHADOW_COPY == 1
+    assert(size == 4096);
+    mmap_allocated++;
+    entry->pages_copy_addr = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_ANONYMOUS|MAP_PRIVATE, -1, 0);
+    if (entry->pages_copy_addr == MAP_FAILED) {
+        vosys_warning("%s: mmap failed (%m)", __func__);
+        entry->pages_copy_addr = NULL;
+    }
+#else
+    /* Fix me: Better to realize a memory pool */
+    entry->pages_copy_addr = g_try_malloc0(size);
+#endif
+    if (!entry->pages_copy_addr) {
+        error_report("%s: Failed to alloc memory", __func__);
+        return false;
+    }
+
+    memcpy(entry->pages_copy_addr, ramblock_ptr(ramblock, offset), size);
+
+    return true;
+}
+
+void ram_next_dirty_pages_to_priority_queue(void) {
+    struct RAMSrcPageRequest *dirty_queue_entry, *next_mspr;
+    RAMState *rs = ram_state;
+    unsigned int page_cpt = 0;
+
+    qemu_mutex_lock(&rs->page_req_mutex);
+
+#if INCR_CHPT_SANITY_CHECKS == 1
+    {
+        struct RAMSrcPageRequest *entry;
+
+        QSIMPLEQ_FOREACH(entry, &rs->page_requests, next_req) {
+            page_cpt++;
+        }
+        if (page_cpt > 0) {
+            vosys_warning("%d pages were left in the main queue", page_cpt);
+        }
+    }
+#endif
+
+    page_cpt = 0;
+
+    QSIMPLEQ_FOREACH_SAFE(dirty_queue_entry, &rs->next_dirty_pages,
+                          next_req, next_mspr)
+    {
+        QSIMPLEQ_REMOVE_HEAD(&rs->next_dirty_pages, next_req);
+
+        QSIMPLEQ_INSERT_TAIL(&rs->page_requests, dirty_queue_entry, next_req);
+
+        if (dirty_queue_entry->pages_copy_addr) {
+#if VOSYS_TRY_MMAP_SHADOW_COPY == 1
+            munmap(dirty_queue_entry->pages_copy_addr, 4096);
+            int diff = mmap_allocated-mmap_deallocated;
+            mmap_alive = mmap_alive > diff ? mmap_alive : diff;
+            mmap_deallocated++;
+#else
+            g_free(dirty_queue_entry->pages_copy_addr);
+#endif
+            dirty_queue_entry->pages_copy_addr = NULL;
+        }
+        /* pages put in the temp dirty queue may have been marked
+         * as clean when saved to disk (ie, if they were dirty before
+         * the snapshot). Force them as dirty now, as we're sure they
+         * are. */
+        int i;
+        size_t target_page_per_host_page = getpagesize() / TARGET_PAGE_SIZE;
+        ram_addr_t host_page_addr = dirty_queue_entry->offset;
+
+        for (i = 0; i < target_page_per_host_page; i++) {
+            ram_addr_t target_page = (host_page_addr + i*TARGET_PAGE_SIZE)
+                                                     >> qemu_target_page_bits();
+            snapshot_bitmap_dirty(dirty_queue_entry->rb, target_page,
+                                  1 /* set */);
+        }
+    }
+
+    qemu_mutex_unlock(&rs->page_req_mutex);
+    vosys_info("%d pages detected as dirty during the checkpointing", page_cpt);
+}
+
+void ram_page_req_mutex(bool lock) {
+    RAMState *rs = ram_state;
+
+    if (lock) {
+        qemu_mutex_lock(&rs->page_req_mutex);
+    } else {
+        qemu_mutex_unlock(&rs->page_req_mutex);
+    }
 }
 
 /**
@@ -2311,7 +2757,9 @@ static void migration_page_queue_free(RAMState *rs)
  * @len: length (in bytes) to send
  */
 
-int ram_save_queue_pages(const char *rbname, ram_addr_t start, ram_addr_t len, bool copy_pages)
+int ram_save_queue_pages(const char *rbname, ram_addr_t start, ram_addr_t len,
+                         bool copy_pages, bool to_priority_queue,
+                         bool to_next_dirty_queue)
 {
     RAMBlock *ramblock;
     RAMState *rs = ram_state;
@@ -2350,26 +2798,80 @@ int ram_save_queue_pages(const char *rbname, ram_addr_t start, ram_addr_t len, b
 
     struct RAMSrcPageRequest *new_entry =
         g_malloc0(sizeof(struct RAMSrcPageRequest));
+
+    struct RAMSrcPageRequest *entry_copy = NULL;
+
     new_entry->rb = ramblock;
     new_entry->offset = start;
     new_entry->len = len;
+    new_entry->consumed_offset = 0;
     if (copy_pages) {
         /* Fix me: Better to realize a memory pool */
+#if VOSYS_TRY_MMAP_SHADOW_COPY == 1
+        assert(len == 4096);
+        mmap_allocated++;
+        new_entry->pages_copy_addr = mmap(NULL, len, PROT_READ|PROT_WRITE, MAP_ANONYMOUS|MAP_PRIVATE, -1, 0);
+
+        if (new_entry->pages_copy_addr == MAP_FAILED) {
+            perror("mmap");
+            new_entry->pages_copy_addr = NULL;
+        }
+#else
         new_entry->pages_copy_addr = g_try_malloc0(len);
+#endif
 
         if (!new_entry->pages_copy_addr) {
             error_report("%s: Failed to alloc memory", __func__);
-            return -1;
+            goto err;
         }
 
         memcpy(new_entry->pages_copy_addr, ramblock_ptr(ramblock, start), len);
+    } else {
+       new_entry->pages_copy_addr = NULL;
     }
 
     memory_region_ref(ramblock->mr);
-    qemu_mutex_lock(&rs->src_page_req_mutex);
-    QSIMPLEQ_INSERT_TAIL(&rs->src_page_requests, new_entry, next_req);
-    migration_make_urgent_request();
-    qemu_mutex_unlock(&rs->src_page_req_mutex);
+
+    if (!to_priority_queue && to_next_dirty_queue) {
+        /* when a page faults during the processing of an
+         * incremental checkpoint, save its content in the priority
+         * queue if it was dirty before the checkpoint (done in
+         * ram_page_in_queue), and put it in the temporary dirty-page
+         * queue, because it dirty for the next checkpoint
+         * anyway... */
+        entry_copy = new_entry;
+        /* ... but do not put it in the priority queue.  */
+        new_entry = NULL;
+    }
+
+    if (to_priority_queue && to_next_dirty_queue) {
+        /* new_entry content will be updated in `unqueue_page`, so
+         * use a copy here */
+        entry_copy = g_malloc0(sizeof(*entry_copy));
+
+        memcpy(entry_copy, new_entry, sizeof(*new_entry));
+        /* for the dirty page tracking, we do not need the shadow copy.  */
+        entry_copy->pages_copy_addr = NULL;
+        memory_region_ref(ramblock->mr);
+    }
+
+    if (to_priority_queue) {
+        if (copy_pages) {
+            QSIMPLEQ_INSERT_HEAD(&rs->page_requests, new_entry, next_req);
+        }  else {
+            QSIMPLEQ_INSERT_TAIL(&rs->page_requests, new_entry, next_req);
+        }
+        migration_make_urgent_request();
+    }
+
+    if (to_next_dirty_queue) {
+        /* During the 1st full snapshot, pages faults indicate
+         * that the page should be saved before being written, but it
+         * should also be included in the dirty-page list of the next
+         * incremental checkpoint.  */
+        QSIMPLEQ_INSERT_TAIL(&rs->next_dirty_pages, entry_copy, next_req);
+    }
+
     rcu_read_unlock();
 
     return 0;
@@ -2455,8 +2957,34 @@ static int ram_save_target_page(RAMState *rs, PageSearchStatus *pss,
         return 1;
     }
 
-    res = save_zero_page(rs, block, offset);
+    if (snapshot_is_incremental()) {
+#if INCR_CHPT_SANITY_CHECKS == 1
+        bool page_was_dirty =
+#endif
+        snapshot_bitmap_dirty(pss->block, pss->page, 0 /* clear */);
+#if INCR_CHPT_SANITY_CHECKS == 1
+        if (!page_was_dirty) {
+            vosys_warning("page %p should have been dirty :(",
+                         (void *) pss->page);
+            abort();
+        }
+#endif
+    }
+#if INCR_CHPT_SANITY_CHECKS == 1
+    else /* full snapshot */ {
+        bool page_is_dirty = snapshot_bitmap_dirty(pss->block, pss->page, -1 /* test */);
+        if (page_is_dirty) {
+            error_report("page %p should not be dirty :(", (void *) pss->page);
+            abort();
+        }
+    }
+#endif
+
+    res = save_zero_page(rs, pss);
     if (res > 0) {
+#if VOSYS_USE_SAVED_TO_DISK_CHECKSUM == 1
+        checksum_page_saved(rs, pss->block, offset, NULL);
+#endif
         /* Must let xbzrle know, otherwise a previous (now 0'd) cached
          * page would be stale
          */
@@ -2466,7 +2994,7 @@ static int ram_save_target_page(RAMState *rs, PageSearchStatus *pss,
             XBZRLE_cache_unlock();
         }
         ram_release_pages(block->idstr, offset, res);
-        return res;
+        goto page_saved;
     }
 
     /*
@@ -2477,9 +3005,33 @@ static int ram_save_target_page(RAMState *rs, PageSearchStatus *pss,
         return ram_save_multifd_page(rs, block, offset);
     }
 
-    return ram_save_page(rs, pss, last_stage);
+    res = ram_save_page(rs, pss, last_stage);
+
+    if (res < 0) {
+        return res;
+    }
+
+page_saved:
+    if (migration_in_snapshot()) {
+#if INCR_CHPT_SANITY_CHECKS == 1
+        bool was_sent =
+#endif
+        snapshot_bitmap_sent(pss->block, pss->page, 1 /* set */);
+
+#if INCR_CHPT_SANITY_CHECKS == 1
+        if (was_sent) {
+            vosys_warning("page %p was already sent :(", (void *) pss->page);
+            abort();
+        }
+#endif
+        snapshot_bitmap_processing_unlock_host_page(pss->block, pss->page
+                                  >> (ram_host_page_bits() - TARGET_PAGE_BITS));
+    }
+
+    return res;
 }
 
+#if 0
 /**
  * ram_save_host_page: save a whole host page
  *
@@ -2527,7 +3079,9 @@ static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss,
             clear_bit(pss->page, pss->block->unsentmap);
         }
 
-        pss->page++;
+        if (!migration_in_snapshot() && pss->block->unsentmap) {
+            clear_bit(pss->page, pss->block->unsentmap);
+        }
     } while ((pss->page & (pagesize_bits - 1)) &&
              offset_in_ramblock(pss->block, pss->page << TARGET_PAGE_BITS));
 
@@ -2535,6 +3089,7 @@ static int ram_save_host_page(RAMState *rs, PageSearchStatus *pss,
     pss->page--;
     return pages;
 }
+#endif
 
 /**
  * ram_find_and_save_block: finds a dirty page and sends it to f
@@ -2562,28 +3117,59 @@ static int ram_find_and_save_block(RAMState *rs, bool last_stage)
         return pages;
     }
 
+retry:
     pss.block = rs->last_seen_block;
     pss.page = rs->last_page;
     pss.complete_round = false;
-    pss.pages_copy = NULL;
 
     if (!pss.block) {
         pss.block = QLIST_FIRST_RCU(&ram_list.blocks);
     }
 
     do {
+        pss.pages_copy = NULL;
         again = true;
         found = get_queued_page(rs, &pss);
 
         if (!found) {
-            /* priority queue empty, so just search for something dirty */
-            found = find_dirty_block(rs, &pss, &again);
+            if (!snapshot_is_incremental()) {
+                /* priority queue empty, so just search for something dirty */
+                found = find_dirty_block(rs, &pss, &again);
+            } else {
+                again = false;
+            }
         }
 
         if (found) {
-            pages = ram_save_host_page(rs, &pss, last_stage);
+            pages = ram_save_target_page(rs,  &pss, last_stage);
         }
+
     } while (!pages && again);
+
+    if (snapshot_is_full() && last_stage) {
+        /* Here we're sure that there are no more dirty pages in
+         * memory, so no more pages can be queued. But a page fault
+         * can have marked a page as not dirty between get_queued_page
+         * and find_dirty_block, so we loop until all the pages have
+         * been sent, to ensure that to page stay in the queue.  */
+        RAMBlock *block;
+
+        rcu_read_lock();
+        RAMBLOCK_FOREACH_NOT_IGNORED(block) {
+            ram_addr_t unsent_page = snapshot_bitmap_find_unsent_page(block, 0);
+
+            if (unsent_page < block->used_length >> TARGET_PAGE_BITS) {
+                vosys_warning("FOUND unsent page at %p, retry (%s)", (void *) unsent_page, block->idstr);
+                ram_addr_t dirty = snapshot_bitmap_find_dirty(block, pss.page);
+                vosys_debug("dirty at %p", (void *) dirty);
+
+                usleep(10000);
+                rs->last_seen_block = block;
+                goto retry;
+            }
+        }
+        vosys_info("No more unsent page");
+    }
 
     rs->last_seen_block = pss.block;
     rs->last_page = pss.page;
@@ -2644,7 +3230,7 @@ static void ram_state_cleanup(RAMState **rsp)
     if (*rsp) {
         migration_page_queue_free(*rsp);
         qemu_mutex_destroy(&(*rsp)->bitmap_mutex);
-        qemu_mutex_destroy(&(*rsp)->src_page_req_mutex);
+        qemu_mutex_destroy(&(*rsp)->page_req_mutex);
         g_free(*rsp);
         *rsp = NULL;
     }
@@ -2676,6 +3262,10 @@ static void ram_save_cleanup(void *opaque)
      */
     memory_global_dirty_log_stop();
 
+    if (snapshot_is_incremental()) {
+        return;
+    }
+
     RAMBLOCK_FOREACH_NOT_IGNORED(block) {
         g_free(block->bmap);
         block->bmap = NULL;
@@ -2694,7 +3284,7 @@ static void ram_state_reset(RAMState *rs)
     rs->last_sent_block = NULL;
     rs->last_page = 0;
     rs->last_version = ram_list.version;
-    rs->ram_bulk_stage = true;
+    rs->ram_bulk_stage = !migration_in_snapshot();
     rs->fpo_enabled = false;
 }
 
@@ -3163,6 +3753,15 @@ err_out:
 
 static int ram_state_init(RAMState **rsp)
 {
+    if (snapshot_is_incremental()) {
+        if (!*rsp) {
+            error_report("%s: Init ramstate should have "
+                         "already been allocated ...", __func__);
+            return -1;
+        }
+        goto skip_allocate;
+    }
+
     *rsp = g_try_new0(RAMState, 1);
 
     if (!*rsp) {
@@ -3171,14 +3770,48 @@ static int ram_state_init(RAMState **rsp)
     }
 
     qemu_mutex_init(&(*rsp)->bitmap_mutex);
-    qemu_mutex_init(&(*rsp)->src_page_req_mutex);
-    QSIMPLEQ_INIT(&(*rsp)->src_page_requests);
+    qemu_mutex_init(&(*rsp)->page_req_mutex);
+
+    QSIMPLEQ_INIT(&(*rsp)->page_requests);
+    QSIMPLEQ_INIT(&(*rsp)->next_dirty_pages);
+
+#if VOSYS_USE_SAVED_TO_DISK_CHECKSUM
+    RAMBlock *rb;
+
+    (*rsp)->saved_to_disk_page_count = -1;
+    RAMBLOCK_FOREACH_NOT_IGNORED(rb) {
+        const char *block_name = qemu_ram_get_idstr(rb);
+        ram_addr_t length = qemu_ram_get_used_length(rb);
+
+        if (strcmp(block_name, "mach-virt.ram") != 0) {
+            continue;
+        }
+        (*rsp)->saved_to_disk_page_count = length >> TARGET_PAGE_BITS;
+        break;
+    }
+
+    assert((*rsp)->saved_to_disk_page_count != -1);
+    (*rsp)->saved_to_disk_page_checksum = g_malloc((*rsp)->saved_to_disk_page_count
+                                                   * sizeof(*(*rsp)->saved_to_disk_page_checksum));
+    if (!(*rsp)->saved_to_disk_page_checksum) {
+        error_report("%s: Could not initialize saved_to_disk_page_checksum ...", __func__);
+        return -1;
+    }
+    unsigned int i;
+    for (i = 0; i < (*rsp)->saved_to_disk_page_count; i++) {
+        (*rsp)->saved_to_disk_page_checksum[i] = 0;
+    }
+    (*rsp)->saved_to_disk_size = 0;
+    (*rsp)->ram_checksum = -1;
+#endif
 
     /*
      * Count the total number of pages used by ram blocks not including any
      * gaps due to alignment or unplugs.
      */
     (*rsp)->migration_dirty_pages = ram_bytes_total() >> TARGET_PAGE_BITS;
+
+skip_allocate:
 
     ram_state_reset(*rsp);
 
@@ -3189,13 +3822,30 @@ static void ram_list_init_bitmaps(void)
 {
     RAMBlock *block;
     unsigned long pages;
+    unsigned long host_pages;
 
     /* Skip setting bitmap if there is no RAM */
     if (ram_bytes_total()) {
         RAMBLOCK_FOREACH_NOT_IGNORED(block) {
             pages = block->max_length >> TARGET_PAGE_BITS;
+            host_pages = block->max_length >> ram_host_page_bits();
             block->bmap = bitmap_new(pages);
             bitmap_set(block->bmap, 0, pages);
+
+            if (snapshot_is_full()) {
+                block->bmap = bitmap_new(pages);
+                bitmap_set(block->bmap, 0, pages);
+
+                block->snapshot.dirty_map = bitmap_new(pages);
+                block->snapshot.processing_map = bitmap_new(host_pages);
+                block->snapshot.sent_map = bitmap_new(pages);
+
+                bitmap_set(block->snapshot.dirty_map, 0, pages);
+            }
+
+            bitmap_clear(block->snapshot.sent_map, 0, pages);
+            bitmap_clear(block->snapshot.processing_map, 0, host_pages);
+
             if (migrate_postcopy_ram()) {
                 block->unsentmap = bitmap_new(pages);
                 bitmap_set(block->unsentmap, 0, pages);
@@ -3379,7 +4029,10 @@ static int ram_save_setup(QEMUFile *f, void *opaque)
     multifd_send_sync_main();
     qemu_put_be64(f, RAM_SAVE_FLAG_EOS);
     qemu_fflush(f);
-
+#if VOSYS_USE_SAVED_TO_DISK_CHECKSUM == 1
+    (*rsp)->saved_to_disk_size = 0;
+    (*rsp)->ram_checksum = -1;
+#endif
     return 0;
 }
 
@@ -3399,12 +4052,23 @@ static int ram_save_iterate(QEMUFile *f, void *opaque)
     int i;
     int64_t t0;
     int done = 0;
+    int pages_sent = 0;
 
     if (blk_mig_bulk_active()) {
         /* Avoid transferring ram during bulk phase of block migration as
          * the bulk phase will usually take a long time and transferring
          * ram updates during that time is pointless. */
         goto out;
+    }
+
+    if (snapshot_is_incremental() &&
+        QSIMPLEQ_EMPTY_ATOMIC(&rs->page_requests)) {
+        vosys_info("Incremental snapshot, but zero page in queue. "
+                    "Skipping RAM iterate");
+        done = true;
+        ret = 0;
+
+        goto end_of_section;
     }
 
     rcu_read_lock();
@@ -3419,8 +4083,9 @@ static int ram_save_iterate(QEMUFile *f, void *opaque)
 
     t0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     i = 0;
+
     while ((ret = qemu_file_rate_limit(f)) == 0 ||
-            !QSIMPLEQ_EMPTY(&rs->src_page_requests)) {
+            !QSIMPLEQ_EMPTY_ATOMIC(&rs->page_requests)) {
         int pages;
 
         if (qemu_file_get_error(f)) {
@@ -3428,9 +4093,10 @@ static int ram_save_iterate(QEMUFile *f, void *opaque)
         }
 
         pages = ram_find_and_save_block(rs, false);
+
         /* no more pages to sent */
         if (pages == 0) {
-            done = 1;
+            done = true;
             break;
         }
 
@@ -3440,23 +4106,27 @@ static int ram_save_iterate(QEMUFile *f, void *opaque)
         }
 
         rs->target_page_count += pages;
+        pages_sent += pages;
 
-        /* we want to check in the 1st loop, just in case it was the 1st time
-           and we had to sync the dirty bitmap.
-           qemu_get_clock_ns() is a bit expensive, so we only check each some
-           iterations
-        */
-        if ((i & 63) == 0) {
-            uint64_t t1 = (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - t0) / 1000000;
-            if (t1 > MAX_WAIT) {
-                trace_ram_save_iterate_big_wait(t1, i);
-                break;
+        if (!migration_in_snapshot()) {
+            /* we want to check in the 1st loop, just in case it was the 1st time
+               and we had to sync the dirty bitmap.
+               qemu_get_clock_ns() is a bit expensive, so we only check each some
+               iterations
+            */
+            if ((i & 63) == 0) {
+                uint64_t t1 = (qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - t0) / 1000000;
+                if (t1 > MAX_WAIT) {
+                    trace_ram_save_iterate_big_wait(t1, i);
+                    break;
+                }
             }
+            i++;
         }
-        i++;
     }
     rcu_read_unlock();
 
+end_of_section:
     /*
      * Must occur before EOS (or any QEMUFile operation)
      * because of RDMA protocol.
@@ -3470,6 +4140,13 @@ out:
     ram_counters.transferred += 8;
 
     ret = qemu_file_get_error(f);
+
+    checkpoint_stats[checkpoint_state.snapshot_number].checkpoint.page_count += pages_sent;
+
+    if (pages_sent > 0) {
+        vosys_info("Saved %d pages (ram/iterate)", pages_sent);
+    }
+
     if (ret < 0) {
         return ret;
     }
@@ -3504,6 +4181,8 @@ static int ram_save_complete(QEMUFile *f, void *opaque)
     /* try transferring iterative blocks of memory */
 
     /* flush all remaining blocks regardless of rate limiting */
+    int pages_sent = 0;
+
     while (true) {
         int pages;
 
@@ -3512,12 +4191,50 @@ static int ram_save_complete(QEMUFile *f, void *opaque)
         if (pages == 0) {
             break;
         }
+
         if (pages < 0) {
             ret = pages;
             break;
         }
+
+        pages_sent += pages;
     }
 
+    checkpoint_stats[checkpoint_state.snapshot_number].checkpoint.page_count += pages_sent;
+
+    if (pages_sent > 0) {
+        error_report("Saved %d pages (ram/complete)", pages_sent);
+
+        if (migration_in_snapshot()) {
+            vosys_warning("expected to find nothing to save at this state, "
+                          "but found %d pages ...", pages_sent);
+        }
+    }
+
+#if VOSYS_USE_SAVED_TO_DISK_CHECKSUM == 1
+    if (migrate_use_checksum()) {
+        unsigned int checksum = 0;
+        unsigned int i;
+        for (i = 0; i < rs->saved_to_disk_page_count; i++) {
+            checksum += rs->saved_to_disk_page_checksum[i];
+        }
+
+        vosys_info("Checksum of pages saved to disk: 0x%x", checksum);
+        vosys_info("Size of pages saved to disk: 0x%x (%d pages)",
+               rs->saved_to_disk_size, rs->saved_to_disk_size/TARGET_PAGE_SIZE);
+        assert(rs->ram_checksum != -1);
+
+        if (rs->ram_checksum != checksum) {
+            vosys_error("Checksum of the RAM not consistent"
+                        " (memory:0x%x and saved:0x%x, diff:%d) ...",
+                        rs->ram_checksum, checksum,
+                        rs->ram_checksum - checksum);
+            //abort();
+        } else {
+            vosys_warning("Checksum validated.");
+        }
+    }
+#endif
     flush_compressed_data(rs);
     ram_control_after_iterate(f, RAM_CONTROL_FINISH);
 
@@ -4246,7 +4963,7 @@ static int ram_load(QEMUFile *f, void *opaque, int version_id)
     if (postcopy_running) {
         ret = ram_load_postcopy(f);
     }
-
+    int pages_loaded = 0;
     while (!postcopy_running && !ret && !(flags & RAM_SAVE_FLAG_EOS)) {
         ram_addr_t addr, total_ram_bytes;
         void *host = NULL;
@@ -4360,12 +5077,14 @@ static int ram_load(QEMUFile *f, void *opaque, int version_id)
             break;
 
         case RAM_SAVE_FLAG_ZERO:
+            pages_loaded++;
             ch = qemu_get_byte(f);
             ram_handle_compressed(host, ch, TARGET_PAGE_SIZE);
             break;
 
         case RAM_SAVE_FLAG_PAGE:
             qemu_get_buffer(f, host, TARGET_PAGE_SIZE);
+            pages_loaded++;
             break;
 
         case RAM_SAVE_FLAG_COMPRESS_PAGE:
@@ -4402,6 +5121,9 @@ static int ram_load(QEMUFile *f, void *opaque, int version_id)
         if (!ret) {
             ret = qemu_file_get_error(f);
         }
+    }
+    if (pages_loaded) {
+        vosys_debug("%d pages loaded", pages_loaded);
     }
 
     ret |= wait_for_decompress_done();
@@ -4575,8 +5297,50 @@ static SaveVMHandlers savevm_ram_handlers = {
     .resume_prepare = ram_resume_prepare,
 };
 
+static int ram_load_checksum(QEMUFile *f, void *opaque, int version_id) {
+    checkpoint_state.reload_has_checksum = qemu_get_byte(f);
+
+
+    if (checkpoint_state.reload_has_checksum) {
+        int checksum_read = qemu_get_be64(f);
+        checkpoint_state.checksum = checksum_read;
+        error_report("SAVED checksum is 0x%x", checksum_read);
+    } else {
+        error_report("NO SAVED checksum");
+    }
+    return 0;
+}
+
+static void ram_save_checksum(QEMUFile *f, void *opaque) {
+    if (runstate_is_running()) {
+        error_report("The VM shouldn't be running when doing the memory checksum ...");
+    }
+
+    if (migrate_use_checksum()) {
+        int checksum = ram_checksum_memory();
+
+        error_report("SAVE checksum 0x%x", checksum);
+
+        qemu_put_byte(f, true);
+        qemu_put_be64(f, checksum);
+#if VOSYS_USE_SAVED_TO_DISK_CHECKSUM == 1
+        assert(ram_state);
+        ram_state->ram_checksum = checksum;
+#endif
+    } else {
+        qemu_put_byte(f, false);
+    }
+}
+
+static SaveVMHandlers savevm_ram_save_checksum_handlers = {
+    .save_state = ram_save_checksum,
+    .load_state = ram_load_checksum,
+};
+
 void ram_mig_init(void)
 {
     qemu_mutex_init(&XBZRLE.lock);
+
     register_savevm_live(NULL, "ram", 0, 4, &savevm_ram_handlers, &ram_state);
+    register_savevm_live(NULL, "ram_checksum", 0, 4, &savevm_ram_save_checksum_handlers, NULL);
 }

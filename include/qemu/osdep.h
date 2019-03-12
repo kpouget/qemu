@@ -325,6 +325,11 @@ void qemu_anon_ram_free(void *ptr, size_t size);
 #else
 #define QEMU_MADV_DONTFORK  QEMU_MADV_INVALID
 #endif
+#ifdef MADV_DOFORK
+#define QEMU_MADV_DOFORK  MADV_DOFORK
+#else
+#define QEMU_MADV_DOFORK  QEMU_MADV_INVALID
+#endif
 #ifdef MADV_MERGEABLE
 #define QEMU_MADV_MERGEABLE MADV_MERGEABLE
 #else

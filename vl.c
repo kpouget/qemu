@@ -29,6 +29,7 @@
 #include "qemu/cutils.h"
 #include "qemu/help_option.h"
 #include "qemu/uuid.h"
+#include "vosys-internal.h"
 #include "sysemu/seccomp.h"
 
 #ifdef CONFIG_SDL
@@ -89,6 +90,7 @@ int main(int argc, char **argv)
 #include "sysemu/dma.h"
 #include "hw/audio/soundhw.h"
 #include "audio/audio.h"
+#include "migration/migration.h"
 #include "sysemu/cpus.h"
 #include "migration/colo.h"
 #include "migration/postcopy-ram.h"
@@ -633,6 +635,7 @@ static const RunStateTransition runstate_transitions_def[] = {
     { RUN_STATE_PAUSED, RUN_STATE_POSTMIGRATE },
     { RUN_STATE_PAUSED, RUN_STATE_PRELAUNCH },
     { RUN_STATE_PAUSED, RUN_STATE_COLO},
+    { RUN_STATE_PAUSED, RUN_STATE_SAVE_VM },
 
     { RUN_STATE_POSTMIGRATE, RUN_STATE_RUNNING },
     { RUN_STATE_POSTMIGRATE, RUN_STATE_FINISH_MIGRATE },
@@ -647,6 +650,7 @@ static const RunStateTransition runstate_transitions_def[] = {
     { RUN_STATE_FINISH_MIGRATE, RUN_STATE_POSTMIGRATE },
     { RUN_STATE_FINISH_MIGRATE, RUN_STATE_PRELAUNCH },
     { RUN_STATE_FINISH_MIGRATE, RUN_STATE_COLO},
+    { RUN_STATE_FINISH_MIGRATE, RUN_STATE_SAVE_VM },
 
     { RUN_STATE_RESTORE_VM, RUN_STATE_RUNNING },
     { RUN_STATE_RESTORE_VM, RUN_STATE_PRELAUNCH },
@@ -666,6 +670,8 @@ static const RunStateTransition runstate_transitions_def[] = {
     { RUN_STATE_RUNNING, RUN_STATE_COLO},
 
     { RUN_STATE_SAVE_VM, RUN_STATE_RUNNING },
+    { RUN_STATE_SAVE_VM, RUN_STATE_PAUSED },
+    { RUN_STATE_SAVE_VM, RUN_STATE_DEBUG },
 
     { RUN_STATE_SHUTDOWN, RUN_STATE_PAUSED },
     { RUN_STATE_SHUTDOWN, RUN_STATE_FINISH_MIGRATE },
@@ -4365,9 +4371,9 @@ int main(int argc, char **argv, char **envp)
         }
     }
 
-    blk_mig_init();
-    ram_mig_init();
-    dirty_bitmap_mig_init();
+    migration_init();
+
+    vosys_init(!!incoming);
 
     /* If the currently selected machine wishes to override the units-per-bus
      * property of its default HBA interface type, do so now. */

@@ -85,6 +85,7 @@
 #include "sysemu/iothread.h"
 #include "qemu/cutils.h"
 #include "tcg/tcg.h"
+#include "vosys-internal-dist.h"
 
 #if defined(TARGET_S390X)
 #include "hw/s390x/storage-keys.h"
@@ -4443,8 +4444,8 @@ static void monitor_event(void *opaque, int event)
         break;
 
     case CHR_EVENT_OPENED:
-        monitor_printf(mon, "QEMU %s monitor - type 'help' for more "
-                       "information\n", QEMU_VERSION);
+        monitor_printf(mon, "QEMU %s-%s monitor - type 'help' for more "
+                       "information\n", QEMU_VERSION, VOSYS_VERSION);
         if (!mon->mux_out) {
             readline_restart(mon->rs);
             readline_show_prompt(mon->rs);

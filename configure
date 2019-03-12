@@ -7486,7 +7486,6 @@ if test -n "$target_compiler"; then
   fi
 fi
 
-
 # generate QEMU_CFLAGS/LDFLAGS for targets
 
 cflags=""
@@ -7634,6 +7633,13 @@ fi
 
 if test "$ccache_cpp2" = "yes"; then
   echo "export CCACHE_CPP2=y" >> $config_host_mak
+fi
+
+use_fuse=yes
+if test "$use_fuse" = "yes" ; then
+  echo 'LIBS+=-L$(BUILD_DIR)/libfuse/install/'$TARGET_ARCH'/lib/ -lfuse -ldl' >> $config_host_mak
+  echo 'QEMU_INCLUDES+=-I$(BUILD_DIR)/libfuse/install/'$TARGET_ARCH'/include' >> $config_host_mak
+  echo 'FUSE_ARCH='$TARGET_ARCH >> $config_host_mak
 fi
 
 # If we're using a separate build tree, set it up now.

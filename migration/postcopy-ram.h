@@ -13,6 +13,15 @@
 #ifndef QEMU_POSTCOPY_RAM_H
 #define QEMU_POSTCOPY_RAM_H
 
+#include "vosys-internal.h"
+#if defined(__linux__) && defined(__NR_userfaultfd) && defined(CONFIG_EVENTFD)
+#if !defined(USE_OLD_UFFD) || USE_OLD_UFFD == 0
+#include <linux/userfaultfd.h>
+#else
+#include <linux/userfaultfd_4.4.h>
+#endif
+#endif
+
 /* Return true if the host supports everything we need to do postcopy-ram */
 bool postcopy_ram_supported_by_host(MigrationIncomingState *mis);
 
@@ -119,6 +128,10 @@ void *postcopy_get_tmp_page(MigrationIncomingState *mis);
 PostcopyState postcopy_state_get(void);
 /* Set the state and return the old state */
 PostcopyState postcopy_state_set(PostcopyState new_state);
+int ram_set_pages_wp(uint64_t page_addr,
+                     uint64_t size,
+                     bool remove,
+                     int uffd);
 
 void postcopy_fault_thread_notify(UserfaultState *us);
 
@@ -196,6 +209,10 @@ int postcopy_request_shared_page(struct PostCopyFD *pcfd, RAMBlock *rb,
                                  uint64_t client_addr, uint64_t offset);
 
 int postcopy_ram_disable_notify(UserfaultState *us);
+
+int postcopy_ram_write_protect(UserfaultState *us);
+
+int postcopy_ram_wprotect_all(UserfaultState *us);
 
 void qemu_mlock_all_memory(void);
 

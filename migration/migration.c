@@ -29,6 +29,7 @@
 #include "qemu-file-channel.h"
 #include "qemu-file.h"
 #include "migration/vmstate.h"
+#include "migration/migration.h"
 #include "block/block.h"
 #include "qapi/error.h"
 #include "qapi/clone-visitor.h"
@@ -41,6 +42,7 @@
 #include "block.h"
 #include "postcopy-ram.h"
 #include "qemu/thread.h"
+#include "hmp.h"
 #include "trace.h"
 #include "exec/target_page.h"
 #include "io/channel-buffer.h"
@@ -49,9 +51,9 @@
 #include "monitor/monitor.h"
 #include "net/announce.h"
 #include "io/channel-tls.h"
-#include "hw/boards.h" /* Fix me: Remove this if we support snapshot for KVM */
-#include <linux/userfaultfd.h>
-
+#include "hw/boards.h"
+#include "vosys-internal.h"
+#include "migration/guest-inform.h"
 
 #define MAX_THROTTLE  (32 << 20)      /* Migration transfer speed throttling */
 
@@ -102,6 +104,20 @@
 #define DEFAULT_MIGRATE_ANNOUNCE_ROUNDS    5
 #define DEFAULT_MIGRATE_ANNOUNCE_STEP    100
 
+/*
+ * Parameters for live and incremental migration capabilities.
+ */
+#define DEFAULT_MIGRATE_LIVE           false
+#define DEFAULT_MIGRATE_INCREMENTAL    false
+
+#define DEFAULT_MIGRATE_CHECKSUM       false
+#define DEFAULT_MIGRATE_COW            false
+
+/* Multiplier to apply to the input checkpoint period. Value is in ms. */
+#ifndef PERIODIC_CHECKPOINT_UNIT
+#define PERIODIC_CHECKPOINT_UNIT 10*1000 /* 10s */
+#endif
+
 static NotifierList migration_state_notifiers =
     NOTIFIER_LIST_INITIALIZER(migration_state_notifiers);
 
@@ -120,6 +136,15 @@ enum mig_rp_message_type {
 
     MIG_RP_MSG_MAX
 };
+
+struct CheckpointState checkpoint_state;
+
+struct CheckpointFileState checkpoint_file_state[NB_CHECKPOINT_FILE_ENTRIES];
+
+struct CheckpointStats checkpoint_stats[NB_CHECKPOINT_FILE_ENTRIES];
+
+pid_t cow_checkpoint_pid = 0;
+struct CheckpointStats *cow_current_stats = NULL;
 
 /* When we add fault tolerance, we could have several
    migrations at once.  For now we don't need to add
@@ -172,6 +197,10 @@ void migration_object_init(void)
     if (ms->enforce_config_section) {
         current_migration->send_configuration = true;
     }
+
+    current_migration->in_periodic_checkpoint = false;
+    current_migration->periodic_checkpoint_timer = NULL;
+    current_migration->periodic_checkpoint_args.uri = NULL;
 }
 
 void migration_shutdown(void)
@@ -198,6 +227,11 @@ MigrationIncomingState *migration_incoming_get_current(void)
     return current_incoming;
 }
 
+static UserfaultState *migration_get_userfault_state(void)
+{
+    return &migration_incoming_get_current()->userfault_state;
+}
+
 void migration_incoming_state_destroy(void)
 {
     struct MigrationIncomingState *mis = migration_incoming_get_current();
@@ -212,10 +246,6 @@ void migration_incoming_state_destroy(void)
     if (mis->from_src_file) {
         qemu_fclose(mis->from_src_file);
         mis->from_src_file = NULL;
-    }
-    if (mis->postcopy_remote_fds) {
-        g_array_free(mis->postcopy_remote_fds, TRUE);
-        mis->postcopy_remote_fds = NULL;
     }
 
     qemu_event_reset(&mis->main_thread_load_event);
@@ -371,9 +401,43 @@ void qemu_start_incoming_migration(const char *uri, Error **errp)
         fd_start_incoming_migration(p, -1, errp);
     } else if (strstart(uri, "file:", &p)) {
         file_start_incoming_migration(p, errp);
+    } else if (strstart(uri, "chpt:", &p)) {
+        int do_squash = strstart(p, "squash:", &p);
+
+        file_start_incoming_checkpoint_reload(p, do_squash, errp);
     } else {
         error_setg(errp, "unknown migration protocol: %s", uri);
     }
+}
+
+static void process_incoming_migration_squash_bh(void *opaque) {
+    MigrationIncomingState *mis = opaque;
+
+    static char uri[MAX_LEN_CHECKPOINT_PATH+MAX_LEN_CHECKPOINT_EXT+1+5];
+    Error *err = NULL;
+
+    migrate_set_state(&mis->state, MIGRATION_STATUS_ACTIVE,
+                      MIGRATION_STATUS_COMPLETED);
+    runstate_set(global_state_get_runstate());
+    checkpoint_state.in_checkpoint_reloading = 0;
+    checkpoint_state.snapshot_number = 0;
+    checkpoint_state.snapshot_cnt = 0;
+
+    sprintf(uri, "chpt:%s_squashed", checkpoint_state.do_squash);
+
+    error_report("Starting squashed checkpoint into %s...", uri);
+
+    qmp_migrate(uri,
+                0, 0, // blk
+                0, 0, // inc
+                0, 0, // detach
+                0, 0, // period
+                0, 0, // resume
+                &err);
+
+    hmp_migrate_setup_squashing_timer(); // wait for the end of the squashing
+
+    return;
 }
 
 static void process_incoming_migration_bh(void *opaque)
@@ -400,6 +464,10 @@ static void process_incoming_migration_bh(void *opaque)
         }
     }
 
+    checkpoint_state.last_checkpoint_ts = time(NULL);
+
+    checkpoint_state.snapshot_number = 0;
+    checkpoint_state.snapshot_cnt = 0;
     /*
      * This must happen after all error conditions are dealt with and
      * we're sure the VM is going to be running on this host.
@@ -429,6 +497,12 @@ static void process_incoming_migration_bh(void *opaque)
     } else {
         runstate_set(global_state_get_runstate());
     }
+
+#if FORCE_CONT_AFTER_RELOAD == 1
+    vosys_info("--- VM FORCE RESTARTED ---");
+    vm_start();
+#endif
+
     /*
      * This must happen after any state changes since as soon as an external
      * observer sees this event they might start to prod at the VM assuming
@@ -440,12 +514,62 @@ static void process_incoming_migration_bh(void *opaque)
     migration_incoming_state_destroy();
 }
 
+static void checkpoint_load_metadata(QEMUFile *f) {
+    unsigned long *test_metadata;
+
+    qemu_peek_buffer(f, (uint8_t **) &test_metadata, sizeof(*test_metadata), 0);
+
+    if (*test_metadata != CHPT_META_MAGIC) {
+        if (checkpoint_state.reload_stop_at != -1) {
+            error_report("This appears NOT to be an incremental checkpoint "
+                         " file. Treating it as a normal Qemu state file.");
+            vosys_debug("Magic number is 0x%lx instead of 0x%lx).",
+                        checkpoint_file_state[0].magic, CHPT_META_MAGIC);
+        }
+
+        checkpoint_file_state[0].is_set = 0;
+
+    } else {
+        int i;
+        qemu_file_skip(f, sizeof(*test_metadata));
+        qemu_get_buffer(f, (uint8_t *) &checkpoint_file_state,
+                        sizeof(checkpoint_file_state));
+        for (i = 0; checkpoint_file_state[i].is_set; i++);
+        vosys_info("Found %d increments in this checkpoint state.", i);
+    }
+
+}
+
+static float get_time_delta(struct timespec start_time,
+                            struct timespec *current_time) {
+    if (clock_gettime(CLOCK_MONOTONIC, current_time) == -1) {
+        vosys_error("increment reloading clock gettime");
+        return 0;
+    }
+
+    float NS_TO_S = 1E-9;
+    float S_TO_MS = 1E3;
+
+
+    return ((current_time->tv_sec - start_time.tv_sec)
+            + (current_time->tv_nsec - start_time.tv_nsec) * NS_TO_S)
+        * S_TO_MS;
+
+}
+
 static void process_incoming_migration_co(void *opaque)
 {
+    static char ts_buffer[30];
     MigrationIncomingState *mis = migration_incoming_get_current();
     PostcopyState ps;
     int ret;
     Error *local_err = NULL;
+
+    struct timespec start_time, current_time;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &start_time) == -1) {
+        vosys_error("%s: start incoming migration clock_gettime", __func__);
+    }
 
     assert(mis->from_src_file);
     mis->migration_incoming_co = qemu_coroutine_self();
@@ -453,7 +577,92 @@ static void process_incoming_migration_co(void *opaque)
     postcopy_state_set(POSTCOPY_INCOMING_NONE);
     migrate_set_state(&mis->state, MIGRATION_STATUS_NONE,
                       MIGRATION_STATUS_ACTIVE);
-    ret = qemu_loadvm_state(mis->from_src_file);
+
+    checkpoint_load_metadata(mis->from_src_file);
+
+    do {
+        struct CheckpointFileState *current_meta =
+            &checkpoint_file_state[checkpoint_state.snapshot_number];
+
+        if (current_meta->is_set) {
+            strftime(ts_buffer, 20, "%Y-%m-%d %H:%M:%S",
+                     localtime(&current_meta->ts));
+        } else {
+            if (checkpoint_state.reload_stop_at == -1) {
+                strcpy(ts_buffer, "single-increment file");
+            } else {
+                strcpy(ts_buffer, "<invalid>");
+            }
+        }
+
+        if (checkpoint_state.reload_stop_at
+                                          == checkpoint_state.snapshot_number) {
+            vosys_debug("Stopping at this increment as requested.");
+            mis->is_last_increment = 1;
+        }
+
+        mis->is_last_increment = !checkpoint_state.in_checkpoint_reloading
+            || (checkpoint_state.snapshot_number == 0 && !current_meta->is_set)
+            || !(current_meta+1)->is_set
+            || mis->is_last_increment;
+
+        error_report("**** Loading increment #%d from %s%s",
+                     checkpoint_state.snapshot_number, ts_buffer,
+                     mis->is_last_increment? " (last chunk)":"");
+
+        ret = loadvm_load_checkpoint(checkpoint_state.snapshot_number);
+
+        if (ret == -EINTR) {
+            /* the partial reloading of this increment is done,
+             * continue with the next one.  */
+            vosys_debug("Increment partially reload done, "
+                        "continue with the next one...");
+            ret = 0;
+        }
+
+        if (ret >= 0) {
+            if (checkpoint_state.reload_has_checksum) {
+                int current_checksum = ram_checksum_memory();
+
+                if (current_checksum == checkpoint_state.checksum) {
+                    vosys_info("Memory checksum after reloading is OK (0x%x)",
+                               current_checksum);
+                } else {
+                    vosys_error("Checksum failed (got 0x%x, expected 0x%x)\n",
+                                current_checksum, checkpoint_state.checksum);
+                    ret = -EIO;
+                }
+            } else {
+                vosys_info("Memory checksum not computed "
+                           "(enabled? %d, found? %zu)",
+                           migrate_use_checksum(),
+                           checkpoint_state.reload_has_checksum);
+            }
+        }
+
+        struct CheckpointStats *current_stats =
+                            &checkpoint_stats[checkpoint_state.snapshot_number];
+        current_stats->is_set = STAT_RELOADING;
+        current_stats->reload.reload_time =
+                                      get_time_delta(start_time, &current_time);
+        current_stats->reload.is_last = mis->is_last_increment;
+
+        vosys_info("Reload time #%d: %f", checkpoint_state.snapshot_number,
+                    current_stats->reload.reload_time);
+
+        if (ret < 0) {
+            break;
+        }
+
+        if (!checkpoint_state.in_checkpoint_reloading) {
+            break;
+        }
+
+        checkpoint_state.snapshot_number++;
+        checkpoint_state.snapshot_cnt++;
+    } while (!mis->is_last_increment);
+    checkpoint_state.reload_stop_at = -1;
+    error_report("*** * ***\n");
 
     ps = postcopy_state_get();
     trace_process_incoming_migration_co_end(ret, ps);
@@ -501,11 +710,22 @@ static void process_incoming_migration_co(void *opaque)
         colo_release_ram_cache();
     }
 
+    checkpoint_state.reload_number++;
+
     if (ret < 0) {
         error_report("load of migration failed: %s", strerror(-ret));
         goto fail;
     }
-    mis->bh = qemu_bh_new(process_incoming_migration_bh, mis);
+
+    guest_inform_connect();
+    guest_inform_reload();
+
+    if (migration_is_squashing()) {
+        mis->bh = qemu_bh_new(process_incoming_migration_squash_bh, mis);
+    } else {
+        mis->bh = qemu_bh_new(process_incoming_migration_bh, mis);
+    }
+
     qemu_bh_schedule(mis->bh);
     mis->migration_incoming_co = NULL;
     return;
@@ -790,6 +1010,10 @@ MigrationParameters *qmp_query_migrate_parameters(Error **errp)
     params->announce_rounds = s->parameters.announce_rounds;
     params->has_announce_step = true;
     params->announce_step = s->parameters.announce_step;
+    params->has_live = true;
+    params->live = s->parameters.live;
+    params->has_incremental = true;
+    params->live = s->parameters.incremental;
 
     return params;
 }
@@ -1025,6 +1249,17 @@ static bool migrate_caps_check(bool *cap_list,
 
         if (cap_list[MIGRATION_CAPABILITY_X_IGNORE_SHARED]) {
             error_setg(errp, "Postcopy is not compatible with ignore-shared");
+            return false;
+        }
+    } else {
+        if (cap_list[MIGRATION_CAPABILITY_INCREMENTAL]) {
+            error_setg(errp, "Cannot do incremental checkpointing"
+                       " if postcopy is disabled.");
+            return false;
+        }
+        if (cap_list[MIGRATION_CAPABILITY_LIVE]) {
+            error_setg(errp, "Cannot do live checkpointing"
+                       " if postcopy is disabled.");
             return false;
         }
     }
@@ -1517,6 +1752,7 @@ static void migrate_fd_cleanup(void *opaque)
 
     if (s->to_dst_file) {
         QEMUFile *tmp;
+        struct CheckpointFileState *meta;
 
         trace_migrate_fd_cleanup();
         qemu_mutex_unlock_iothread();
@@ -1528,6 +1764,28 @@ static void migrate_fd_cleanup(void *opaque)
 
         multifd_save_cleanup();
         qemu_mutex_lock(&s->qemu_file_lock);
+
+        {
+            if (!migrate_use_cow()) {
+                /* checkpoint_state.snapshot_number has already been
+                   incremented here. */
+                meta = &checkpoint_file_state[checkpoint_state.snapshot_number - 1];
+
+            } else if (cow_checkpoint_pid == 0) {
+                // in the CoW child
+                meta = &checkpoint_file_state[checkpoint_state.snapshot_number];
+            } else {
+                // in the CoW parent
+                goto skip_cleanup;
+            }
+
+            qemu_fflush(s->to_dst_file);
+            meta->end_of_file_offset = qemu_ftell(s->to_dst_file);
+
+        skip_cleanup:
+            vosys_debug("Checkpoint cleaned up"); /* avoid 'label at end of compound statement' error */
+        }
+
         tmp = s->to_dst_file;
         s->to_dst_file = NULL;
         qemu_mutex_unlock(&s->qemu_file_lock);
@@ -1538,10 +1796,12 @@ static void migrate_fd_cleanup(void *opaque)
         qemu_fclose(tmp);
     }
 
-    assert((s->state != MIGRATION_STATUS_ACTIVE) &&
-           (s->state != MIGRATION_STATUS_POSTCOPY_ACTIVE));
+    assert(s->state != MIGRATION_STATUS_POSTCOPY_ACTIVE);
 
-    if (s->state == MIGRATION_STATUS_CANCELLING) {
+    if (s->state == MIGRATION_STATUS_ACTIVE) {
+        migrate_set_state(&s->state, MIGRATION_STATUS_ACTIVE,
+                          MIGRATION_STATUS_COMPLETED);
+    } else if (s->state == MIGRATION_STATUS_CANCELLING) {
         migrate_set_state(&s->state, MIGRATION_STATUS_CANCELLING,
                           MIGRATION_STATUS_CANCELLED);
     }
@@ -1685,6 +1945,132 @@ bool migration_in_snapshot(void)
     MigrationState *s = migrate_get_current();
 
     return s->in_snapshot;
+}
+
+bool snapshot_is_incremental(void)
+{
+    MigrationState *s = migrate_get_current();
+
+    return s->snapshot_is_incremental;
+}
+
+bool snapshot_is_full(void)
+{
+    return !snapshot_is_incremental();
+}
+
+bool migration_inside_incremental_checkpoint(void)
+{
+    MigrationState *s = migrate_get_current();
+
+    return s->inside_incremental_snapshot;
+}
+
+bool incoming_migration_is_last_increment(void)
+{
+    MigrationIncomingState *mis = migration_incoming_get_current();
+
+    return mis->is_last_increment;
+}
+
+bool migration_is_squashing(void)
+{
+    return checkpoint_state.do_squash;
+}
+
+static void periodic_checkpoint_state_notifier(Notifier *notifier, void *data)
+{
+    MigrationState *s = data;
+
+    if (migration_has_finished(s)) {
+        if (s->in_periodic_checkpoint != PERIODIC_CHECKPOINT_DISABLED) {
+            timer_mod(s->periodic_checkpoint_timer,
+                      qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL_RT) +
+                 s->periodic_checkpoint_args.period * PERIODIC_CHECKPOINT_UNIT);
+        }
+    } else if (migration_has_failed(s)) {
+        timer_del(s->periodic_checkpoint_timer);
+
+        s->in_periodic_checkpoint = PERIODIC_CHECKPOINT_DISABLED;
+        notifier_remove(&s->checkpoint_notifier);
+    }
+}
+
+/* Periodic checkpoint timer callback function */
+static void periodic_checkpoint_timer_cb(void *opaque)
+{
+    MigrationState *s = migrate_get_current();
+    Error *err = NULL;
+
+    if (s->in_periodic_checkpoint == PERIODIC_CHECKPOINT_DISABLED) {
+        return;
+    }
+
+    switch (s->state) {
+    case MIGRATION_STATUS_ACTIVE:
+    {
+        error_report("Periodic checkpointing: Timer triggered with an "
+                     "active migration, this should not happen");
+        break;
+    }
+    case MIGRATION_STATUS_CANCELLED:
+    case MIGRATION_STATUS_FAILED:
+    {
+        error_report("Periodic: Checkpointing failed!");
+        assert(s->in_periodic_checkpoint == PERIODIC_CHECKPOINT_DISABLED);
+    }
+    break;
+    case MIGRATION_STATUS_COMPLETED:
+    {
+        const char *uri = s->periodic_checkpoint_args.uri;
+        bool blk = s->periodic_checkpoint_args.blk;
+        bool blk_inc = s->periodic_checkpoint_args.blk_inc;
+
+        assert(!migration_inside_incremental_checkpoint());
+        qmp_migrate(uri, !!blk, blk, !!blk_inc, blk_inc, false, false, false, 0,
+                    false, false, &err);
+    }
+    break;
+    default:
+        /* unhandled migration state */
+        error_report("Periodic: Unhandled migration state! (%d)", s->state);
+    }
+}
+
+/* Periodic checkpoint setup function */
+static bool periodic_checkpoint_setup(const char *uri, bool blk, bool blk_inc,
+                                      int64_t period)
+{
+    MigrationState *s = migrate_get_current();
+
+    if (period == 0) {  /* disable periodic checkpointting */
+        timer_del(s->periodic_checkpoint_timer);
+
+        s->in_periodic_checkpoint = PERIODIC_CHECKPOINT_DISABLED;
+        notifier_remove(&s->checkpoint_notifier);
+
+    } else {  /* enable periodic checkpointting */
+        if (s->periodic_checkpoint_args.uri) {
+            g_free(s->periodic_checkpoint_args.uri);
+        }
+
+        s->periodic_checkpoint_args.uri = g_malloc(strlen(uri)+1);
+        strcpy(s->periodic_checkpoint_args.uri, uri);
+
+        s->periodic_checkpoint_args.blk = blk;
+        s->periodic_checkpoint_args.blk_inc = blk_inc;
+        s->periodic_checkpoint_args.period = period;
+
+        s->periodic_checkpoint_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL_RT,
+                                                   periodic_checkpoint_timer_cb,
+                                                    NULL);
+
+        s->in_periodic_checkpoint = PERIODIC_CHECKPOINT_INITIAL;
+        s->checkpoint_notifier.notify = periodic_checkpoint_state_notifier;
+        notifier_list_add(&migration_state_notifiers, &s->checkpoint_notifier);
+    }
+
+    return s->in_periodic_checkpoint;
 }
 
 void migrate_init(MigrationState *s)
@@ -1839,7 +2225,8 @@ bool migration_is_blocked(Error **errp)
 }
 
 /* Returns true if continue to migrate, or false if error detected */
-static bool migrate_prepare(MigrationState *s, bool blk, bool blk_inc,
+static bool migrate_prepare(MigrationState *s, const char *uri, bool blk,
+                            bool blk_inc, bool has_period, int64_t period,
                             bool resume, Error **errp)
 {
     Error *local_err = NULL;
@@ -1909,19 +2296,34 @@ static bool migrate_prepare(MigrationState *s, bool blk, bool blk_inc,
 
     migrate_init(s);
 
+    if (has_period) {
+        if (period < 0) {
+            error_setg(errp, "Command option 'period' must be >= 0.");
+            return false;
+        }
+
+        periodic_checkpoint_setup(uri, blk, blk_inc, period);
+
+        if (period == 0) {
+            /* Do not perform the checkpoint while disabling it */
+            return false;
+        }
+    }
+
     return true;
 }
 
 void qmp_migrate(const char *uri, bool has_blk, bool blk,
                  bool has_inc, bool inc, bool has_detach, bool detach,
+                 bool has_period, int64_t period,
                  bool has_resume, bool resume, Error **errp)
 {
     Error *local_err = NULL;
     MigrationState *s = migrate_get_current();
     const char *p;
 
-    if (!migrate_prepare(s, has_blk && blk, has_inc && inc,
-                         has_resume && resume, errp)) {
+    if (!migrate_prepare(s, uri, has_blk && blk, has_inc && inc,
+                         has_period, period, has_resume && resume, errp)) {
         /* Error detected, put into errp */
         return;
     }
@@ -1940,6 +2342,30 @@ void qmp_migrate(const char *uri, bool has_blk, bool blk,
         fd_start_outgoing_migration(s, p, -1, &local_err);
     } else if (strstart(uri, "file:", &p)) {
         file_start_outgoing_migration(s, p, &local_err);
+    } else if (strstart(uri, "chpt:", &p)) {
+        /* KP: shortcut to unique checkpoint name */
+        const char *target = p;
+        int snapshot_number = checkpoint_state.snapshot_number;
+
+        if (strcmp(target, "") == 0) {
+            char default_pattern[128];
+
+            sprintf(default_pattern, "/tmp/vm_checkpoint.%s", vosys_get_qemu_id());
+            target = default_pattern;
+        }
+
+        s->in_snapshot = true;
+        if (snapshot_number == 0) {
+            memset(checkpoint_file_state, 0, sizeof(checkpoint_file_state));
+        }
+
+        checkpoint_file_state[snapshot_number].is_set = 1;
+        checkpoint_file_state[snapshot_number].ts = time(NULL);
+        checkpoint_file_state[snapshot_number].end_of_file_offset = 0;
+        checkpoint_file_state[snapshot_number].magic = CHPT_META_MAGIC;
+
+        error_report("Snapshot into '%s'", target);
+        file_start_outgoing_migration(s, target, &local_err);
     } else {
         error_setg(errp, QERR_INVALID_PARAMETER_VALUE, "uri",
                    "a valid migration protocol");
@@ -2139,6 +2565,25 @@ bool migrate_use_events(void)
     return s->enabled_capabilities[MIGRATION_CAPABILITY_EVENTS];
 }
 
+bool migrate_use_incremental(void)
+{
+    MigrationState *s;
+
+    s = migrate_get_current();
+
+    return s->enabled_capabilities[MIGRATION_CAPABILITY_INCREMENTAL];
+}
+
+bool migrate_use_live(void)
+{
+    MigrationState *s;
+
+    s = migrate_get_current();
+
+    return s->enabled_capabilities[MIGRATION_CAPABILITY_LIVE];
+}
+
+
 bool migrate_use_multifd(void)
 {
     MigrationState *s;
@@ -2174,6 +2619,24 @@ int migrate_multifd_page_count(void)
     s = migrate_get_current();
 
     return s->parameters.x_multifd_page_count;
+}
+
+bool migrate_use_checksum(void)
+{
+    MigrationState *s;
+
+    s = migrate_get_current();
+
+    return s->enabled_capabilities[MIGRATION_CAPABILITY_CHECKSUM];
+}
+
+bool migrate_use_cow(void)
+{
+    MigrationState *s;
+
+    s = migrate_get_current();
+
+    return s->enabled_capabilities[MIGRATION_CAPABILITY_COW];
 }
 
 int migrate_use_xbzrle(void)
@@ -2278,7 +2741,7 @@ static void migrate_handle_rp_req_pages(MigrationState *ms, const char* rbname,
         return;
     }
 
-    if (ram_save_queue_pages(rbname, start, len, false)) {
+    if (ram_save_queue_pages(rbname, start, len, false, true, false)) {
         mark_source_rp_bad(ms);
     }
 }
@@ -3175,11 +3638,15 @@ static void migration_iteration_finish(MigrationState *s)
 
 void migration_make_urgent_request(void)
 {
+    if (migration_in_snapshot()) return;
+
     qemu_sem_post(&migrate_get_current()->rate_limit_sem);
 }
 
 void migration_consume_urgent_request(void)
 {
+    if (migration_in_snapshot()) return;
+
     qemu_sem_wait(&migrate_get_current()->rate_limit_sem);
 }
 
@@ -3300,12 +3767,42 @@ static void *migration_thread(void *opaque)
     return NULL;
 }
 
+static void snapshot_reset_increments(void)
+{
+    int i;
+
+    for (i = 0; i < checkpoint_state.snapshot_number; i++) {
+        checkpoint_stats[i].is_set = 0;
+        checkpoint_file_state[i].is_set = 0;
+    }
+    checkpoint_state.snapshot_number = 0;
+    checkpoint_state.snapshot_cnt = 0;
+}
+
+extern int mmap_allocated;
+extern int mmap_deallocated;
+extern int mmap_alive;
+
+static int cow_do_fork_block(RAMBlock *rb,  void *opaque)
+{
+    void *host_addr = qemu_ram_get_host_addr(rb);
+    ram_addr_t length = qemu_ram_get_used_length(rb);
+    bool do_fork = (bool) opaque;
+    int advise = do_fork ? QEMU_MADV_DOFORK : QEMU_MADV_DONTFORK;
+
+    qemu_madvise(host_addr, length, advise);
+    return 0;
+}
+
 static void *snapshot_thread(void *opaque)
 {
     MigrationState *ms = opaque;
     bool old_vm_running = false;
     QIOChannelBuffer *buffer = NULL;
     int ret;
+    struct timespec start_time, device_time, memory_time, overall_time;
+    struct CheckpointStats *current_stats;
+    int begin_time = time(NULL);
 
     rcu_register_thread();
 
@@ -3315,42 +3812,308 @@ static void *snapshot_thread(void *opaque)
     qemu_system_wakeup_request(QEMU_WAKEUP_REASON_OTHER, NULL);
     old_vm_running = runstate_is_running();
     ret = global_state_store();
-    if (!ret) {
-        ret = vm_stop_force_state(RUN_STATE_SAVE_VM);
-        if (ret < 0) {
-            error_report("Failed to stop VM");
-            goto error;
-        }
+    if (ret < 0) {
+        error_report("Failed to save the global state ...");
+        qemu_mutex_unlock_iothread();
+        goto error;
     }
-    postcopy_ram_register_wp(&ms->userfault_state);
-    buffer = qemu_save_device_buffer();
 
-    if (old_vm_running) {
-        vm_start();
+    vosys_debug("--- VM STOP ---");
+    ret = vm_stop_force_state(RUN_STATE_SAVE_VM);
+    if (ret < 0) {
+        error_report("Failed to stop VM");
+        qemu_mutex_unlock_iothread();
+        goto error;
     }
     qemu_mutex_unlock_iothread();
 
-    migrate_set_state(&ms->state, MIGRATION_STATUS_SETUP, MIGRATION_STATUS_ACTIVE);
+    qemu_savevm_state_setup(ms->to_dst_file);
+
+    qemu_mutex_lock_iothread();
+
+    ret = qemu_file_get_error(ms->to_dst_file);
+    if (ret != 0) {
+        error_report("qemu_savevm_state_setup failed ...");
+        qemu_mutex_unlock_iothread();
+        goto error;
+    }
+
+    ram_counters.postcopy_requests = 0;
+
+    if (!migrate_use_cow()) {
+        current_stats = &checkpoint_stats[checkpoint_state.snapshot_cnt];
+    } else {
+        if (cow_current_stats != NULL) {
+            munmap(cow_current_stats, sizeof(*cow_current_stats));
+        }
+        cow_current_stats = mmap(NULL, sizeof(*cow_current_stats),
+                                 PROT_READ | PROT_WRITE,
+                                 MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        current_stats = cow_current_stats;
+    }
+
+    if (clock_gettime(CLOCK_MONOTONIC, &start_time) == -1) {
+        vosys_warning("start incoming migration clock_gettime failed (%m)");
+    }
+
+    current_stats->checkpoint.page_count = 0;
+    current_stats->checkpoint.time = begin_time;
+    current_stats->checkpoint.time_since_last_cpt =
+                              begin_time - checkpoint_state.last_checkpoint_ts ;
+
+    checkpoint_state.last_checkpoint_ts = begin_time;
+
+    buffer = qemu_save_device_buffer();
+
+    qemu_mutex_unlock_iothread();
+
+    migrate_set_state(&ms->state, MIGRATION_STATUS_SETUP,
+                      MIGRATION_STATUS_ACTIVE);
 
     trace_snapshot_thread_setup_complete();
 
-    /* Save VM's Live state, such as RAM */
+    current_stats->checkpoint.device_time =
+                                       get_time_delta(start_time, &device_time);
+
+    if (migrate_use_cow()) {
+        foreach_not_ignored_block(cow_do_fork_block, (void *) true);
+        qemu_fflush(ms->to_dst_file);
+        /* make sure this thread owns the mutex (for the child) */
+        qemu_mutex_lock_iothread();
+
+        if (runstate_is_running()) {
+            vosys_crash("The VM shouldn't be running when doing the CoW fork ...");
+        }
+
+        if (checkpoint_state.snapshot_number == 0) {
+            /* add hack to get it CoW checkpointing working correctly! */
+            int checksum = ram_checksum_memory();
+            vosys_info("Mandatory checksum for CoW: 0x%x", checksum);
+        }
+
+        cow_checkpoint_pid = fork();
+        qemu_mutex_unlock_iothread();
+
+        if (cow_checkpoint_pid == -1) {
+            perror("CoW process fork failed:");
+            old_vm_running = 0;
+        }
+
+        if (cow_checkpoint_pid == 0) {
+            // in the child
+            old_vm_running = 0; // don't restart the VM in the child, for fox sake!
+        } else {
+            // in the parent
+            vosys_info("CoW checkpoint process forked: pid=%d", cow_checkpoint_pid );
+
+            foreach_not_ignored_block(cow_do_fork_block, (void *)false);
+
+            /* mark all the pages as not dirty, as they will be saved in the child */
+            snapshot_bitmap_reset_all_dirty();
+            if (snapshot_is_full()) {
+                ret = postcopy_ram_register_wp(migration_get_userfault_state());
+            } else {
+                ret = postcopy_ram_wprotect_all(migration_get_userfault_state());
+            }
+            if (ret < 0) {
+                    error_report("Post-copy mode NOT WORKING, disabling "
+                                 "incremental/live checkpointing");
+                    ms->enabled_capabilities[MIGRATION_CAPABILITY_INCREMENTAL] = false;
+                    ms->enabled_capabilities[MIGRATION_CAPABILITY_LIVE] = false;
+                    ms->enabled_capabilities[MIGRATION_CAPABILITY_POSTCOPY_RAM] = false;
+            }
+            goto snapshot_finished;
+         }
+     } else {
+        if (snapshot_is_full()) {
+            if (migrate_use_live() || migrate_use_incremental()) {
+                ret = postcopy_ram_register_wp(migration_get_userfault_state());
+
+                if (ret < 0) {
+                    error_report("Post-copy mode NOT WORKING, disabling "
+                                 "incremental/live checkpointing");
+                    ms->enabled_capabilities[MIGRATION_CAPABILITY_INCREMENTAL] = false;
+                    ms->enabled_capabilities[MIGRATION_CAPABILITY_LIVE] = false;
+                    ms->enabled_capabilities[MIGRATION_CAPABILITY_POSTCOPY_RAM] = false;
+                }
+            }
+        } else {
+            ms->inside_incremental_snapshot = true;
+            if (migrate_use_live() || migrate_use_incremental()) {
+                postcopy_ram_wprotect_all(migration_get_userfault_state());
+            }
+        }
+    }
+
+    if (old_vm_running && migrate_use_live()) {
+        qemu_mutex_lock_iothread();
+        vosys_debug("--- VM START ---");
+        vm_start();
+        qemu_mutex_unlock_iothread();
+    }
+
+    vosys_debug("<qemu_savevm_state_iterate started>");
+    while (qemu_file_get_error(ms->to_dst_file) == 0) {
+        if (qemu_savevm_state_iterate(ms->to_dst_file, false) > 0) {
+            vosys_debug("<break after qemu_savevm_state_iterate>");
+            break;
+        }
+
+        if (migrate_use_live()) {
+            vosys_debug("<sleep after qemu_savevm_state_iterate break>");
+        }
+
+        qemu_file_reset_rate_limit(ms->to_dst_file);
+    }
+    vosys_debug("<qemu_savevm_state_iterate finished>");
+
+    qemu_mutex_lock_iothread();
+    ret = qemu_file_get_error(ms->to_dst_file);
+    if (ret == 0) {
+        qemu_savevm_state_complete_precopy(ms->to_dst_file, true, false);
+    } else {
+        migrate_set_state(&ms->state, MIGRATION_STATUS_ACTIVE,
+                          MIGRATION_STATUS_FAILED);
+        errno = -ret;
+        error_report("Checkpointing failed: %m");
+    }
+    qemu_mutex_unlock_iothread();
+
+    if (ret != 0) {
+        goto snapshot_finished;
+    }
 
     qemu_save_buffer_file(ms, buffer);
     ret = qemu_file_get_error(ms->to_dst_file);
     if (ret < 0) {
-        migrate_set_state(&ms->state, MIGRATION_STATUS_ACTIVE, MIGRATION_STATUS_FAILED);
-    } else {
         migrate_set_state(&ms->state, MIGRATION_STATUS_ACTIVE,
-                          MIGRATION_STATUS_COMPLETED);
+                          MIGRATION_STATUS_FAILED);
+        errno = -ret;
+        error_report("Checkpointing failed: %m");
+        old_vm_running = 0; // do not restart the VM after a checkpoint error
+    }
+    current_stats->checkpoint.memory_time =
+                                      get_time_delta(device_time, &memory_time);
+    current_stats->checkpoint.overall_time =
+                                      get_time_delta(start_time, &overall_time);
+    current_stats->is_set = STAT_CHECKPOINTING;
+
+    error_report("Snapshot %d finished after %.3fms", checkpoint_state.snapshot_cnt,
+                 current_stats->checkpoint.overall_time);
+
+    vosys_debug("%d pages allocated", mmap_allocated);
+    vosys_debug("%d pages dellocated", mmap_deallocated);
+    vosys_info("max alive: %d pages", mmap_alive);
+
+    if (migrate_use_cow()) {
+        // this is the CoW child (=the calf :)
+        qemu_mutex_lock_iothread();
+        ms->migration_thread_running = false;
+        migrate_fd_cleanup(ms);
+        current_stats->checkpoint.page_count = checkpoint_stats[checkpoint_state.snapshot_cnt].checkpoint.page_count;
+        current_stats->checkpoint.end_of_file_offset = checkpoint_file_state[checkpoint_state.snapshot_number].end_of_file_offset;
+
+        vosys_info("###");
+        vosys_info("### CHECKPOINT %d FINISHED", checkpoint_state.snapshot_number);
+        vosys_info("###");
+        exit(0);
     }
 
-    postcopy_ram_disable_notify(&ms->userfault_state);
+snapshot_finished:
+    guest_inform_checkpoint_finished();
+
+    if (snapshot_is_incremental() &&
+        checkpoint_state.snapshot_number == NB_CHECKPOINT_FILE_ENTRIES -1)
+    {
+        error_report("Incremental checkpointing reached max number "
+                     "of increments (%d).  Reseting the counter.",
+                     NB_CHECKPOINT_FILE_ENTRIES);
+        snapshot_reset_increments();
+        checkpoint_state.snapshot_number = -1; // next snapshot will be full
+        checkpoint_state.snapshot_cnt = -1;
+    }
+
+    /* for incremental checkpoints, after 1st full snapshot, we do not
+       disable the fault tracking, but write-protect it to track pages
+       getting dirty.  */
+    if (!migrate_use_incremental()
+        || checkpoint_state.snapshot_number == -1
+        || ret)
+    {
+        /* normal snapshots, do not activate dirty page tracking */
+        if (migrate_use_live()) {
+            postcopy_ram_disable_notify(migration_get_userfault_state());
+        }
+
+        vosys_info("Dirty pages tracking **NOT** activated");
+
+        if (ret) {
+            old_vm_running = 0; // don't restart the VM after a checkpoint error
+            vosys_warning("Stopping the VM. Run command 'cont' to restart it.");
+            qemu_mutex_lock_iothread();
+            vm_stop_force_state(RUN_STATE_SAVE_VM);
+            qemu_mutex_unlock_iothread();
+
+        }
+    } else {
+        assert(migrate_postcopy_ram());
+
+        if (old_vm_running && migrate_use_live()) {
+
+            qemu_mutex_lock_iothread();
+            qemu_system_wakeup_request(QEMU_WAKEUP_REASON_OTHER, NULL);
+
+            if (!migrate_use_cow()) {
+                /* check again if the VM has been stopped or restarted
+                   since the begining of the checkpoint */
+                old_vm_running = runstate_is_running();
+            }
+
+            ret = vm_stop_force_state(RUN_STATE_SAVE_VM);
+            if (ret < 0) {
+                qemu_mutex_unlock_iothread();
+                error_report("Failed to stop VM");
+                goto error;
+            }
+
+            qemu_mutex_unlock_iothread();
+        }
+
+        if (clock_gettime(CLOCK_MONOTONIC, &start_time) == -1) {
+            perror("start incoming migration clock_gettime");
+        }
+
+        checkpoint_state.snapshot_number++;
+
+        vosys_info("%ld pages faulted during the snapshot",
+                   ram_counters.postcopy_requests);
+
+        vosys_info("Starting incremental checkpoint %d ... ",
+                   checkpoint_state.snapshot_cnt + 1);
+        vosys_info("Activating dirty pages tracking ... ");
+
+        /* flush the queue now, not in the bottom-end, as it will be
+           populated again as soon as we restart the execution.  */
+        ram_next_dirty_pages_to_priority_queue();
+
+        ms->snapshot_is_incremental = true;
+        ms->inside_incremental_snapshot = false;
+    }
+    checkpoint_state.snapshot_cnt++;
 
     qemu_mutex_lock_iothread();
+
+    if (old_vm_running && !migration_is_squashing()) {
+        vosys_debug("--- VM START ---");
+        vm_start();
+    } else if (runstate_check(RUN_STATE_SAVE_VM)) {
+        runstate_set(RUN_STATE_PAUSED);
+    }
+
     qemu_savevm_state_cleanup();
     qemu_bh_schedule(ms->cleanup_bh);
     qemu_mutex_unlock_iothread();
+
 error:
     rcu_unregister_thread();
     return NULL;
@@ -3374,8 +4137,11 @@ void migrate_fd_connect(MigrationState *s, Error *error_in)
         rate_limit = INT64_MAX;
     } else {
         /* This is a fresh new migration */
-        rate_limit = s->parameters.max_bandwidth / XFER_LIMIT_RATIO;
-
+        if (!migration_in_snapshot()) {
+            rate_limit = s->parameters.max_bandwidth / XFER_LIMIT_RATIO;
+        } else {
+            rate_limit = 0;
+        }
         /* Notify before starting migration thread */
         notifier_list_notify(&migration_state_notifiers, s);
     }
@@ -3388,7 +4154,8 @@ void migrate_fd_connect(MigrationState *s, Error *error_in)
      * precopy, only if user specified "return-path" capability would
      * QEMU uses the return path.
      */
-    if (migrate_postcopy_ram() || migrate_use_return_path()) {
+    if (!migration_in_snapshot() &&
+        (migrate_postcopy_ram() || migrate_use_return_path())) {
         if (open_return_path_on_source(s, !resume)) {
             error_report("Unable to open return-path for postcopy");
             migrate_set_state(&s->state, s->state, MIGRATION_STATUS_FAILED);
@@ -3507,6 +4274,18 @@ static Property migration_properties[] = {
     DEFINE_PROP_SIZE("announce-step", MigrationState,
                       parameters.announce_step,
                       DEFAULT_MIGRATE_ANNOUNCE_STEP),
+    DEFINE_PROP_BOOL("live", MigrationState,
+                      parameters.live,
+                      DEFAULT_MIGRATE_LIVE),
+    DEFINE_PROP_BOOL("incremental", MigrationState,
+                     parameters.incremental,
+                     DEFAULT_MIGRATE_INCREMENTAL),
+    DEFINE_PROP_BOOL("checksum", MigrationState,
+                     parameters.checksum,
+                     DEFAULT_MIGRATE_CHECKSUM),
+    DEFINE_PROP_BOOL("cow", MigrationState,
+                     parameters.cow,
+                     DEFAULT_MIGRATE_COW),
 
     /* Migration capabilities */
     DEFINE_PROP_MIG_CAP("x-xbzrle", MIGRATION_CAPABILITY_XBZRLE),
@@ -3521,6 +4300,10 @@ static Property migration_properties[] = {
     DEFINE_PROP_MIG_CAP("x-block", MIGRATION_CAPABILITY_BLOCK),
     DEFINE_PROP_MIG_CAP("x-return-path", MIGRATION_CAPABILITY_RETURN_PATH),
     DEFINE_PROP_MIG_CAP("x-multifd", MIGRATION_CAPABILITY_X_MULTIFD),
+    DEFINE_PROP_MIG_CAP("x-live", MIGRATION_CAPABILITY_LIVE),
+    DEFINE_PROP_MIG_CAP("x-incremental", MIGRATION_CAPABILITY_INCREMENTAL),
+    DEFINE_PROP_MIG_CAP("x-checksum", MIGRATION_CAPABILITY_CHECKSUM),
+    DEFINE_PROP_MIG_CAP("x-cow", MIGRATION_CAPABILITY_COW),
 
     DEFINE_PROP_END_OF_LIST(),
 };
@@ -3644,3 +4427,12 @@ static void register_migration_types(void)
 }
 
 type_init(register_migration_types);
+
+void migration_init(void) {
+    blk_mig_init();
+    ram_mig_init();
+    dirty_bitmap_mig_init();
+
+    checkpoint_state.reload_number = 0;
+    checkpoint_state.last_checkpoint_ts = time(NULL);
+}

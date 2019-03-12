@@ -138,6 +138,9 @@ GENERATED_FILES += $(TRACE_SOURCES)
 GENERATED_FILES += $(BUILD_DIR)/trace-events-all
 GENERATED_FILES += .git-submodule-status
 
+GENERATED_FILES += $(SRC_PATH)/vosys-internal-git.gen.h
+GENERATED_FILES += $(SRC_PATH)/libfuse/install/$(ARCH)/include/fuse/fuse.h
+
 trace-group-name = $(shell dirname $1 | sed -e 's/[^a-zA-Z0-9]/_/g')
 
 tracetool-y = $(SRC_PATH)/scripts/tracetool.py
@@ -545,6 +548,16 @@ qapi-gen-timestamp: $(qapi-modules) $(qapi-py)
 	@>$@
 
 QGALIB_GEN=$(addprefix qga/qapi-generated/, qga-qapi-types.h qga-qapi-visit.h qga-qapi-commands.h)
+
+GIT_REF=$(shell cat $(SRC_PATH)/.git/HEAD | cut -b6-)
+$(SRC_PATH)/vosys-internal-git.gen.h : #$(SRC_PATH)/.git/HEAD $(SRC_PATH)/.git/$(GIT_REF)
+	$(call quiet-command, bash $(SRC_PATH)/scripts/vosys-git-version.sh $@, \
+	    "GEN","$@")
+
+$(SRC_PATH)/libfuse/install/$(ARCH)/include/fuse/fuse.h:
+	echo ARCH is $(FUSE_ARCH)
+	make -C $(SRC_PATH)/libfuse install SRC_PATH=$(SRC_PATH)/libfuse ARCH=$(FUSE_ARCH)
+
 $(qga-obj-y): $(QGALIB_GEN)
 
 qemu-ga$(EXESUF): $(qga-obj-y) $(COMMON_LDADDS)

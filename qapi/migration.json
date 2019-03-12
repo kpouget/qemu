@@ -415,6 +415,16 @@
 #
 # @x-ignore-shared: If enabled, QEMU will not migrate shared memory (since 4.0)
 #
+# @incremental: Controls whether or not to enable the incremental checkpointing.
+#          Requires postcopy-ram to be enabled.
+#
+# @live: Controls whether or not to enable the live checkpointing.
+#          Requires postcopy-ram to be enabled.
+#
+# @period: the period (in 10s unit) at which the checkpointing will be
+#          performed (default value is 0, do a single one)
+#
+
 # Since: 1.2
 ##
 { 'enum': 'MigrationCapability',
@@ -422,7 +432,8 @@
            'compress', 'events', 'postcopy-ram', 'x-colo', 'release-ram',
            'block', 'return-path', 'pause-before-switchover', 'x-multifd',
            'dirty-bitmaps', 'postcopy-blocktime', 'late-block-activate',
-           'x-ignore-shared' ] }
+           'x-ignore-shared', 'incremental', 'live', 'period', 'checksum',
+           'cow' ] }
 
 ##
 # @MigrationCapabilityStatus:
@@ -577,6 +588,12 @@
 # @max-cpu-throttle: maximum cpu throttle percentage.
 #                    Defaults to 99. (Since 3.1)
 #
+# @incremental: Controls whether or not to enable the incremental checkpointing.
+#               Requires postcopy-ram to be enabled.
+#
+# @live: Controls whether or not to enable the live checkpointing.
+#        Requires postcopy-ram to be enabled.
+#
 # Since: 2.4
 ##
 { 'enum': 'MigrationParameter',
@@ -589,7 +606,8 @@
            'downtime-limit', 'x-checkpoint-delay', 'block-incremental',
            'x-multifd-channels', 'x-multifd-page-count',
            'xbzrle-cache-size', 'max-postcopy-bandwidth',
-           'max-cpu-throttle' ] }
+           'max-cpu-throttle', 'incremental', 'live', 'period',
+           'checksum', 'cow' ] }
 
 ##
 # @MigrateSetParameters:
@@ -816,6 +834,14 @@
 #                    Defaults to 99.
 #                     (Since 3.1)
 #
+# @incremental: Controls whether or not to enable the incremental checkpointing.
+#          Requires postcopy-ram to be enabled.
+#
+# @live: Controls whether or not to enable the live checkpointing.
+#          Requires postcopy-ram to be enabled.
+# @cow: Controls whether or not to enable the Copy-on-write mode of the
+#          checkpointing (for performance comparison with UFFD)
+#
 # Since: 2.4
 ##
 { 'struct': 'MigrationParameters',
@@ -839,7 +865,11 @@
             '*x-multifd-page-count': 'uint32',
             '*xbzrle-cache-size': 'size',
 	    '*max-postcopy-bandwidth': 'size',
-            '*max-cpu-throttle':'uint8'} }
+            '*max-cpu-throttle':'uint8',
+            '*incremental': 'bool',
+            '*live': 'bool',
+            '*checksum': 'bool',
+            '*cow': 'bool' } }
 
 ##
 # @query-migrate-parameters:
@@ -1205,6 +1235,8 @@
 # @detach: this argument exists only for compatibility reasons and
 #          is ignored by QEMU
 #
+# @period: initiate a periodic checkpointing with this period.
+#
 # @resume: resume one paused migration, default "off". (since 3.0)
 #
 # Returns: nothing on success
@@ -1229,7 +1261,7 @@
 ##
 { 'command': 'migrate',
   'data': {'uri': 'str', '*blk': 'bool', '*inc': 'bool',
-           '*detach': 'bool', '*resume': 'bool' } }
+           '*detach': 'bool', '*period': 'int', '*resume': 'bool' } }
 
 ##
 # @migrate-incoming:

@@ -50,6 +50,12 @@ struct RAMBlock {
     unsigned long *unsentmap;
     /* bitmap of already received pages in postcopy */
     unsigned long *receivedmap;
+
+    struct {
+        unsigned long *dirty_map;
+        unsigned long *processing_map;
+        unsigned long *sent_map;
+    } snapshot;
 };
 
 static inline bool offset_in_ramblock(RAMBlock *b, ram_addr_t offset)

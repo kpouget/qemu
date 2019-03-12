@@ -32,6 +32,14 @@
 #include "sysemu/balloon.h"
 #include "qemu/error-report.h"
 #include "trace.h"
+#include "cpu.h"
+#include <math.h>
+#include "vosys-internal.h"
+
+#define UFFD_USE_UNREGISTER 1 /* unprotect (0) or unregister (1) */
+/* WARNING: version UNREGISTER requires the VM to be stopped, in order
+   not to miss any fault. UNPROTECT is currently not working. */
+
 
 /* Arbitrary limit on size of each discard command,
  * keeps them around ~200 bytes
@@ -51,6 +59,11 @@ struct PostcopyDiscardState {
 };
 
 static NotifierWithReturnList postcopy_notifier_list;
+
+static inline uintptr_t ram_host_page_bits(void)
+{
+    return log2(qemu_host_page_size);
+}
 
 void postcopy_infrastructure_init(void)
 {
@@ -91,7 +104,13 @@ int postcopy_notify(enum PostcopyNotifyReason reason, Error **errp)
 
 #if defined(__linux__) && defined(__NR_userfaultfd) && defined(CONFIG_EVENTFD)
 #include <sys/eventfd.h>
+#if !defined(USE_OLD_UFFD) || USE_OLD_UFFD == 0
+int uffd_use_old_interface = 0;
 #include <linux/userfaultfd.h>
+#else
+int uffd_use_old_interface = 1;
+#include <linux/userfaultfd_4.4.h>
+#endif
 
 typedef struct PostcopyBlocktimeContext {
     /* time when page fault initiated per vCPU */
@@ -114,6 +133,13 @@ typedef struct PostcopyBlocktimeContext {
     Notifier exit_notifier;
 } PostcopyBlocktimeContext;
 
+
+static int uffd_wake(int uffd, ram_addr_t region, size_t len);
+static int uffd_unregister_protection(int uffd, ram_addr_t region, size_t len);
+static int uffd_protection(int uffd, ram_addr_t page_addr, size_t len,
+                           int remove);
+
+#ifdef UFFD_FEATURE_THREAD_ID
 static void destroy_blocktime_context(struct PostcopyBlocktimeContext *ctx)
 {
     g_free(ctx->page_fault_vcpu_time);
@@ -141,6 +167,7 @@ static struct PostcopyBlocktimeContext *blocktime_context_new(void)
     qemu_add_exit_notifier(&ctx->exit_notifier);
     return ctx;
 }
+#endif
 
 static uint32List *get_vcpu_blocktime_list(PostcopyBlocktimeContext *ctx)
 {
@@ -539,6 +566,29 @@ static void postcopy_balloon_inhibit(bool state)
     }
 }
 
+#if UFFD_USE_UNREGISTER == 0 /* unprotect (0) or unregister (1) ? */
+static int postcopy_ram_write_protect_cb(RAMBlock *rb, void *opaque)
+{
+    UserfaultState *us = opaque;
+    ram_addr_t offset = qemu_ram_get_offset(rb);
+    ram_addr_t length = qemu_ram_get_used_length(rb);
+
+    return ram_set_pages_wp((uintptr_t) host_addr, length,
+                            /* remove? */ false,  us->userfault_fd);
+}
+
+static int postcopy_ram_write_protect(UserfaultState *us)
+{
+    if (us->have_fault_thread) {
+        /* Mark so that we get notified of accesses to unwritten areas */
+        if (foreach_not_ignored_block(postcopy_ram_write_protect_cb, us)) {
+            return -1;
+        }
+    }
+    return 0;
+}
+#endif /* UFFD_USE_UNREGISTER == 0 */
+
 int postcopy_ram_disable_notify(UserfaultState *us)
 {
     if (us->have_fault_thread) {
@@ -644,29 +694,25 @@ int postcopy_ram_prepare_discard(MigrationIncomingState *mis)
     return 0;
 }
 
-static int ram_set_pages_wp(uint64_t page_addr,
-                            uint64_t size,
-                            bool remove,
-                            int uffd)
+int ram_set_pages_wp(ram_addr_t page_addr,
+                     uint64_t size,
+                     bool remove,
+                     int uffd)
 {
-    struct uffdio_writeprotect wp_struct;
-
-    memset(&wp_struct, 0, sizeof(wp_struct));
-    wp_struct.range.start = (uint64_t)(uintptr_t)page_addr;
-    wp_struct.range.len = size;
+    int ret;
     if (remove) {
-        wp_struct.mode = UFFDIO_WRITEPROTECT_MODE_DONTWAKE;
+#if UFFD_USE_UNREGISTER == 1 /* unprotect (0) or unregister (1) ? */
+        ret = uffd_unregister_protection(uffd, page_addr, size);
+        if (ret == 0) {
+            ret = uffd_wake(uffd, page_addr, size);
+        }
+#else /* USE UNPROTECT */
+        ret = uffd_protection(uffd, page_addr, size, remove);
+#endif
     } else {
-        wp_struct.mode = UFFDIO_WRITEPROTECT_MODE_WP;
+        ret = uffd_protection(uffd, page_addr, size, remove);
     }
-    if (ioctl(uffd, UFFDIO_WRITEPROTECT, &wp_struct)) {
-        int e = errno;
-        error_report("%s: %s  page_addr: 0x%lx",
-                     __func__, strerror(e), page_addr);
-
-        return -e;
-    }
-    return 0;
+    return ret;
 }
 
 /*
@@ -763,6 +809,7 @@ int postcopy_request_shared_page(struct PostCopyFD *pcfd, RAMBlock *rb,
     return 0;
 }
 
+#if !defined(USE_OLD_UFFD) || USE_OLD_UFFD == 0
 static int get_mem_fault_cpu_index(uint32_t pid)
 {
     CPUState *cpu_iter;
@@ -776,6 +823,7 @@ static int get_mem_fault_cpu_index(uint32_t pid)
     trace_get_mem_fault_cpu_index(-1, pid);
     return -1;
 }
+#endif
 
 static uint32_t get_low_time_offset(PostcopyBlocktimeContext *dc)
 {
@@ -784,6 +832,7 @@ static uint32_t get_low_time_offset(PostcopyBlocktimeContext *dc)
     return start_time_offset < 1 ? 1 : start_time_offset & UINT32_MAX;
 }
 
+#if !defined(USE_OLD_UFFD) || USE_OLD_UFFD == 0
 /*
  * This function is being called when pagefault occurs. It
  * tracks down vCPU blocking time.
@@ -829,6 +878,7 @@ static void mark_postcopy_blocktime_begin(uintptr_t addr, uint32_t ptid,
     trace_mark_postcopy_blocktime_begin(addr, dc, dc->page_fault_vcpu_time[cpu],
                                         cpu, already_received);
 }
+#endif
 
 /*
  *  This function just provide calculated blocktime per cpu and trace it.
@@ -916,6 +966,56 @@ static bool postcopy_pause_fault_thread(MigrationIncomingState *mis)
     return true;
 }
 
+static
+int uffd_protection(int uffd, ram_addr_t page_addr, size_t len, int remove) {
+    struct uffdio_writeprotect wp_struct;
+
+    memset(&wp_struct, 0, sizeof(wp_struct));
+    wp_struct.range.start = (uint64_t)(uintptr_t)page_addr;
+    wp_struct.range.len = len;
+    if (remove) {
+        wp_struct.mode = 0;
+    } else {
+        wp_struct.mode = UFFDIO_WRITEPROTECT_MODE_WP;
+    }
+    if (ioctl(uffd, UFFDIO_WRITEPROTECT, &wp_struct)) {
+        int e = errno;
+        error_report("%s: %s page_addr: 0x%lx",
+                     __func__, strerror(e), page_addr);
+
+        return -e;
+    }
+    return 0;
+}
+
+static
+int uffd_wake(int uffd, ram_addr_t region, size_t len) {
+    struct uffdio_range wake;
+
+    wake.start = (long long) region;
+    wake.len = len;
+
+    if (ioctl(uffd, UFFDIO_WAKE, &wake) == -1) {
+        error_report("ioctl UFFDIO_WAKE failed: %m");
+        return -1;
+    }
+    return 0;
+}
+
+static
+int uffd_unregister_protection(int uffd, ram_addr_t region, size_t len) {
+    struct uffdio_register uffdio_register;
+
+    uffdio_register.range.start = (unsigned long)region;
+    uffdio_register.range.len = len;
+
+    if (ioctl(uffd, UFFDIO_UNREGISTER, &uffdio_register.range) == -1) {
+          error_report("ioctl UFFDIO_UNREGISTER failed: %m");
+          return -1;
+    }
+    return 0;
+}
+
 /*
  * Handle faults detected by the USERFAULT markings
  */
@@ -971,7 +1071,7 @@ static void *postcopy_ram_fault_thread(void *opaque)
             break;
         }
 
-        if (!mis->to_src_file) {
+        if (!migration_in_snapshot() && !mis->to_src_file) {
             /*
              * Possibly someone tells us that the return path is
              * broken already using the event. We should hold until
@@ -1041,6 +1141,7 @@ static void *postcopy_ram_fault_thread(void *opaque)
             }
 
             rb_offset &= ~(qemu_ram_pagesize(rb) - 1);
+#if !defined(USE_OLD_UFFD) || USE_OLD_UFFD == 0
             trace_postcopy_ram_fault_thread_request(msg.arg.pagefault.address,
                                                 qemu_ram_get_idstr(rb),
                                                 rb_offset,
@@ -1048,8 +1149,9 @@ static void *postcopy_ram_fault_thread(void *opaque)
             mark_postcopy_blocktime_begin(
                     (uintptr_t)(msg.arg.pagefault.address),
                                 msg.arg.pagefault.feat.ptid, rb);
-
+#endif
 retry:
+            if (!migration_in_snapshot()) {
             /*
              * Send the request to the source - we want to request one
              * of our host page sizes (which is >= TPS)
@@ -1080,6 +1182,7 @@ retry:
                                  __func__, ret);
                     break;
                 }
+            }
             }
         }
 
@@ -1157,38 +1260,218 @@ retry:
                 migrate_send_rp_req_pages(mis, NULL,
                                           rb_offset, qemu_ram_pagesize(rb));
             }
-        } else { /* UFFDIO_REGISTER_MODE_WP */
-            MigrationState *ms = container_of(us, MigrationState,
-                                              userfault_state);
-            ret = ram_save_queue_pages(qemu_ram_get_idstr(rb), rb_offset,
-                                       qemu_ram_pagesize(rb), true);
+        } else if (msg.arg.pagefault.flags & UFFD_PAGEFAULT_FLAG_WP) {
+            /* UFFDIO_REGISTER_MODE_WP: write-protection pagefault */
+
+            const char *rb_name = qemu_ram_get_idstr(rb);
+            bool copy_pages;
+            size_t hostpagesize = getpagesize();
+            bool to_priority_queue, to_next_dirty_queue;
+            bool host_page_was_dirty;
+            bool wait_for_sent = false;
+            ram_addr_t host_addr = rb_offset;
+
+            /* take the queue lock early (=before the processing lock), to avoid
+             * deadlocks and races) */
+
+            ram_page_req_mutex(true /* lock */);
+
+#if 0
+            vosys_warning("FAULT      %p",  (void *) rb_offset);
+#endif
+
+            /* in full snapshot, backup the current content of the page. */
+            if (snapshot_is_full()) {
+                int target_pages_per_host_page =
+                                         qemu_target_page_size() / hostpagesize;
+                int i;
+
+                host_page_was_dirty = true;
+                /* mark the target pages as clean */
+                for (i = 0; i < target_pages_per_host_page; i++) {
+                    ram_addr_t target_page = (host_addr +
+                                              i*qemu_target_page_size())
+                                                     >> qemu_target_page_bits();
+                    bool target_page_was_dirty =
+                          snapshot_bitmap_dirty(rb, target_page, 0 /* clear */);
+
+                    if (target_page_was_dirty) {
+                        continue;
+                    }
+
+                    /* this target page was not dirty, abort! it was
+                     * cleaned by the snapshot_thread, which will copy
+                     * it to disk from memory. Let it do and block until it's
+                     * done with 'wait_for_sent = true' */
+                    host_page_was_dirty = false;
+
+                    /* remark as dirty the page we've just marked as clean */
+                    for (i-- /* start at previous dirty page */; i >= 0; i--) {
+                        target_page = (host_addr + i*qemu_target_page_size())
+                                                     >> qemu_target_page_bits();
+                        snapshot_bitmap_dirty(rb, target_page, 1 /* set */);
+                    }
+                    break;
+                }
+
+                to_next_dirty_queue = true;
+
+                if (host_page_was_dirty) {
+                    to_priority_queue = true;
+                    copy_pages = true;
+                    wait_for_sent = false;
+                } else /* host page was not dirty */ {
+                    to_priority_queue = false;
+                    copy_pages = false;
+                    wait_for_sent = true;
+                }
+
+            } else /* incremental checkpoint */ {
+                int i;
+                int target_pages_per_host_page =
+                                         qemu_target_page_size() / hostpagesize;
+
+                host_page_was_dirty = false;
+                /* mark the target pages as dirty */
+                for (i = 0; i < target_pages_per_host_page; i++) {
+                    ram_addr_t target_page = (host_addr +
+                                              i*qemu_target_page_size())
+                                                     >> qemu_target_page_bits();
+                    bool target_page_was_dirty =
+                            snapshot_bitmap_dirty(rb, target_page, 1 /* set */);
+
+                    host_page_was_dirty = host_page_was_dirty
+                                                        | target_page_was_dirty;
+                }
+
+                if (migration_inside_incremental_checkpoint()) {
+                    to_next_dirty_queue = true;
+                    copy_pages = false;
+                    to_priority_queue = false;
+
+                    if (!host_page_was_dirty) {
+                        wait_for_sent = false;
+
+                    } else {
+                        /* lock the host pages for processing (only if
+                         * not already set) */
+                        bool host_page_locked =
+                            snapshot_bitmap_processing_lock_host_page(rb,
+                                             host_addr >> ram_host_page_bits());
+
+                        if (host_page_locked) {
+#if INCR_CHPT_SANITY_CHECKS == 1
+                            int found =
+#endif
+                            /* the page was dirty, it's not being
+                             * processed, we can copy its content to
+                             * shadow memory and attach it to the
+                             * queue entry. This operation is
+                             * protected by the 'processing' flag set
+                             * to the page.  */
+                            ram_update_page_in_queue(rb_name, rb_offset,
+                                                     hostpagesize);
+#if INCR_CHPT_SANITY_CHECKS == 1
+                            if (!found) {
+                                vosys_error("******************************");
+                                vosys_error("dirty page '0x"RAM_ADDR_FMT
+                                            "' not the updated in priority queue",
+                                            rb_offset);
+                                vosys_crash("Checkpoint error detected :(");
+                                vosys_error("******************************");
+                                abort();
+                            }
+#endif
+                            snapshot_bitmap_processing_unlock_host_page(rb,
+                                             host_addr >> ram_host_page_bits());
+
+                            wait_for_sent = false;
+                        } else {
+                            wait_for_sent = true;
+                        }
+                    }
+                } else {
+#if INCR_CHPT_SANITY_CHECKS == 1
+                    if (host_page_was_dirty) {
+                        vosys_error("page at address %p should not be dirty here",
+                                    (void *) host_addr);
+                        abort();
+                    }
+#endif
+                    copy_pages = false;
+                    to_priority_queue = true;
+                    to_next_dirty_queue = false;
+                    wait_for_sent = false;
+                }
+            }
+
+            /* the host page was fully unprocessed, it's now
+             * marked as dirty (but not sent), we can queue it.  */
+            ret = ram_save_queue_pages(rb_name, rb_offset, hostpagesize,
+                                       copy_pages,
+                                       to_priority_queue, to_next_dirty_queue);
 
             if (ret < 0) {
                 error_report("%s: Save: %"PRIx64 " failed!",
                              __func__, (uint64_t)msg.arg.pagefault.address);
-                break;
             }
 
-            /* Note: In the setup process, snapshot_thread may modify VM's
-            * write-protected pages, we should not block it there, or there
-            * will be an deadlock error.
-            */
-            if (migration_in_setup(ms)) {
-                uint64_t host = msg.arg.pagefault.address;
+            ram_page_req_mutex(false /* unlock */);
 
-                host &= ~(qemu_ram_pagesize(rb) - 1);
-                ret = ram_set_pages_wp(host, getpagesize(), true,
-                                       us->userfault_fd);
-                if (ret < 0) {
-                    error_report("Remove page's write-protect failed");
+            if (wait_for_sent) {
+                /* ... and wait for all of them to be sent before
+                 * unprotecting the host page.  */
+                int i;
+                int target_pages_per_host_page =
+                                         qemu_target_page_size() / hostpagesize;
+                for (i = 0; i < target_pages_per_host_page; i++) {
+                    ram_addr_t target_page = (host_addr +
+                                              i*qemu_target_page_size())
+                                                     >> qemu_target_page_bits();
+                    int sleep_time = 0;
+                    while (!snapshot_bitmap_sent(rb, target_page,
+                                                 -1 /* test */)) {
+                        usleep(100);
+                        sleep_time++;
+                    }
+                    if (sleep_time) {
+                        vosys_debug("WAITED FOR %d*100us for the page %p to be "
+                                    "sent", sleep_time, (void *) target_page);
+
+                    }
                 }
             }
+
+            /* in a full snapshot, the page has been saved before
+               being put in the queue.  In dirty-page tracking, we do
+               not care about its content now.  */
+
+            ram_set_pages_wp(msg.arg.pagefault.address, hostpagesize,
+                             /* remove? */ true, us->userfault_fd);
+        } else {
+            error_report("%s: Unrecognized userfaultfd event (0x%llx)",
+                         __func__, msg.arg.pagefault.flags);
         }
     }
     rcu_unregister_thread();
     trace_postcopy_ram_fault_thread_exit();
     g_free(pfd);
     return NULL;
+}
+
+int postcopy_ram_wprotect_all(UserfaultState *us) {
+#if UFFD_USE_UNREGISTER == 1 /* unprotect (0) or unregister (1) ? */
+    if (foreach_not_ignored_block(cleanup_range, us)) {
+        return -1;
+    }
+    if (foreach_not_ignored_block(ram_block_enable_notify, us)) {
+        return -1;
+    }
+#else  /* USE UNPROTECT */
+    postcopy_ram_write_protect(us);
+#endif
+
+    return 0;
 }
 
 static
@@ -1243,6 +1526,12 @@ int postcopy_ram_register_userfaults(UserfaultState *us, int mode)
      * that would cause false userfaults.
      */
     postcopy_balloon_inhibit(true);
+
+#if UFFD_USE_UNREGISTER == 0
+    vosys_debug("UFFD: use UNPROTECT mode");
+#else
+    vosys_debug("UFFD: use UNREGISTER mode");
+#endif
 
     trace_postcopy_ram_enable_notify();
 
@@ -1315,7 +1604,8 @@ int postcopy_place_page(MigrationIncomingState *mis, void *host, void *from,
      * which would be slightly cheaper, but we'd have to be careful
      * of the order of updating our page state.
      */
-    if (qemu_ufd_copy_ioctl(mis->userfault_state.userfault_fd, host, from, pagesize, rb)) {
+    if (qemu_ufd_copy_ioctl(mis->userfault_state.userfault_fd, host, from,
+                            pagesize, rb)) {
         int e = errno;
         error_report("%s: %s copy host: %p from: %p (size: %zd)",
                      __func__, strerror(e), host, from, pagesize);
@@ -1404,6 +1694,8 @@ void fill_destination_postcopy_migration_info(MigrationInfo *info)
 {
 }
 
+int uffd_use_old_interface = -1;
+
 bool postcopy_ram_supported_by_host(MigrationIncomingState *mis)
 {
     error_report("%s: No OS support", __func__);
@@ -1465,12 +1757,6 @@ void *postcopy_get_tmp_page(MigrationIncomingState *mis)
 {
     assert(0);
     return NULL;
-}
-
-
-int postcopy_ram_enable_notify(UserfaultState *us, int mode) {
-    assert(0);
-    return -1;
 }
 
 int postcopy_wake_shared(struct PostCopyFD *pcfd,

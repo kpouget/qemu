@@ -27,6 +27,18 @@ struct PostcopyBlocktimeContext;
 
 #define  MIGRATION_RESUME_ACK_VALUE  (1)
 
+#define VOSYS_TRY_MMAP_SHADOW_COPY 1
+
+#ifndef VOSYS_TRY_MMAP_SHADOW_COPY
+#define VOSYS_TRY_MMAP_SHADOW_COPY 0
+#endif
+
+#define INCR_CHPT_SANITY_CHECKS 1
+
+#define PERIODIC_CHECKPOINT_DISABLED 0x00
+#define PERIODIC_CHECKPOINT_INITIAL  0x01
+#define PERIODIC_CHECKPOINT_RUNNING  0x02
+
 struct UserfaultState {
     bool           have_fault_thread;
     QemuThread     fault_thread;
@@ -78,6 +90,9 @@ struct MigrationIncomingState {
 
     int state;
 
+    bool in_snapshot;
+    bool is_last_increment;
+
     bool have_colo_incoming_thread;
     QemuThread colo_incoming_thread;
     /* The coroutine we should enter (back) after failover */
@@ -97,6 +112,14 @@ struct MigrationIncomingState {
 
     /* List of listening socket addresses  */
     SocketAddressList *socket_address_list;
+};
+
+/* QMP arguments for the on-ongoing periodic checkpointing */
+struct CurrentMigrationArgs {
+    char *uri;
+    int  period;
+    bool blk;
+    bool blk_inc;
 };
 
 MigrationIncomingState *migration_incoming_get_current(void);
@@ -199,9 +222,17 @@ struct MigrationState
     /* Flag set once the migration thread is running (and needs joining) */
     bool migration_thread_running;
 
-    UserfaultState userfault_state;
+    bool in_snapshot;
+    bool snapshot_is_incremental;
+    bool inside_incremental_snapshot;
 
-    bool in_snapshot; /* for snapshot */
+    /* Periodic checkpoint state */
+    uint8_t in_periodic_checkpoint;
+    QEMUTimer *periodic_checkpoint_timer;
+    struct CurrentMigrationArgs periodic_checkpoint_args;
+
+    /* Callback notifier for when a migration state is changed */
+    Notifier checkpoint_notifier;
 
     /* Flag set once the migration thread called bdrv_inactivate_all */
     bool block_inactive;
@@ -253,6 +284,8 @@ struct MigrationState
     bool decompress_error_check;
 };
 
+bool incoming_migration_is_last_increment(void);
+
 void migrate_set_state(int *state, int old_state, int new_state);
 
 void migration_fd_process_incoming(QEMUFile *f);
@@ -266,14 +299,22 @@ uint64_t migrate_max_downtime(void);
 void migrate_set_error(MigrationState *s, const Error *error);
 void migrate_fd_error(MigrationState *s, const Error *error);
 
-void migrate_fd_connect(MigrationState *s, Error *error_in);
 
+void migrate_fd_connect(MigrationState *s, Error *error_in);
 
 bool migration_is_setup_or_active(int state);
 
 void migrate_init(MigrationState *s);
+
+int migrate_fd_close(MigrationState *s);
+int loadvm_load_checkpoint(int checkpoint_number);
+int file_get_checkpoint_fd(int snapshot_number);
+
 bool migration_in_snapshot(void);
+bool snapshot_is_incremental(void);
+bool snapshot_is_full(void);
 bool migration_is_blocked(Error **errp);
+bool migration_inside_incremental_checkpoint(void);
 /* True if outgoing migration has entered postcopy phase */
 bool migration_in_postcopy(void);
 MigrationState *migrate_get_current(void);
@@ -309,6 +350,13 @@ int migrate_compress_wait_thread(void);
 int migrate_decompress_threads(void);
 bool migrate_use_events(void);
 bool migrate_postcopy_blocktime(void);
+bool migrate_use_incremental(void);
+bool migrate_use_checksum(void);
+bool migrate_use_live(void);
+bool migrate_use_cow(void);
+
+void file_start_incoming_checkpoint_reload(const char *filename, int do_squash,
+                                           Error **errp);
 
 /* Sending on the return path - generic and then for each message type */
 void migrate_send_rp_shut(MigrationIncomingState *mis,
@@ -332,5 +380,65 @@ int foreach_not_ignored_block(RAMBlockIterFunc func, void *opaque);
 
 void migration_make_urgent_request(void);
 void migration_consume_urgent_request(void);
+
+#define MAX_LEN_CHECKPOINT_PATH 128
+#define MAX_LEN_CHECKPOINT_EXT 8
+
+struct CheckpointState {
+    int snapshot_cnt;
+    int snapshot_number;
+    int checksum;
+    size_t reload_has_checksum;
+    char checkpoint_reload_prefix[MAX_LEN_CHECKPOINT_PATH+1];
+    int in_checkpoint_reloading;
+    int last_checkpoint_ts;
+    int reload_stop_at;
+    int reload_number;
+    int reload_fd;
+    const char *do_squash;
+};
+
+#define NB_CHECKPOINT_FILE_ENTRIES 100
+#define CHPT_META_MAGIC 0x1234l
+
+struct CheckpointFileState {
+    bool is_set;
+    time_t ts;
+    uint64_t end_of_file_offset;
+    unsigned long magic;
+};
+
+enum CheckpointStatsType {
+    STAT_UNSET = 0,
+    STAT_RELOADING,
+    STAT_CHECKPOINTING
+};
+
+struct CheckpointStats {
+    enum CheckpointStatsType is_set;
+    union {
+        struct {
+            float reload_time;
+            int is_last;
+        } reload;
+        struct {
+            int page_count;
+
+            float device_time;
+            float memory_time;
+            float overall_time;
+
+            int time;
+            int time_since_last_cpt;
+
+            uint64_t end_of_file_offset; /* KP: only for CoW checkpointing */
+        } checkpoint;
+    };
+};
+
+extern struct CheckpointFileState checkpoint_file_state[NB_CHECKPOINT_FILE_ENTRIES];
+extern struct CheckpointStats checkpoint_stats[NB_CHECKPOINT_FILE_ENTRIES];
+
+extern struct CheckpointState checkpoint_state;
 
 #endif

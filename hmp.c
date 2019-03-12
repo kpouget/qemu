@@ -198,7 +198,7 @@ void hmp_info_migrate(Monitor *mon, const QDict *qdict)
     migration_global_dump(mon);
 
     /* do not display parameters during setup */
-    if (info->has_status && caps) {
+    if (caps) {
         monitor_printf(mon, "capabilities: ");
         for (cap = caps; cap; cap = cap->next) {
             monitor_printf(mon, "%s: %s ",
@@ -2076,17 +2076,35 @@ static void hmp_migrate_status_cb(void *opaque)
                 progress = 100;
             }
 
-            monitor_printf(status->mon, "Completed %d %%\r", progress);
-            monitor_flush(status->mon);
+            if (!migration_is_squashing()) {
+                monitor_printf(status->mon, "Completed %d %%\r", progress);
+                monitor_flush(status->mon);
+            }
         }
 
         timer_mod(status->timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 1000);
     } else {
-        if (status->is_block_migration) {
+        if (!migration_is_squashing()
+            && status->is_block_migration) {
             monitor_printf(status->mon, "\n");
         }
         if (info->has_error_desc) {
             error_report("%s", info->error_desc);
+        }
+
+        if (migration_is_squashing()) {
+            int ret = EXIT_SUCCESS;
+
+            if (info->has_status && info->status == MIGRATION_STATUS_FAILED) {
+                error_report("Squashing failed...");
+                ret = EXIT_FAILURE;
+            } else if (info->has_status && info->status == MIGRATION_STATUS_COMPLETED) {
+                error_report("Squashing completed!");
+
+            } else if (info->has_status && info->status == MIGRATION_STATUS_COMPLETED) {
+                error_report("Squashing completed with status %d", info->status);
+            }
+            exit(ret);
         }
         monitor_resume(status->mon);
         timer_del(status->timer);
@@ -2097,17 +2115,27 @@ static void hmp_migrate_status_cb(void *opaque)
     qapi_free_MigrationInfo(info);
 }
 
+void hmp_migrate_setup_squashing_timer(void) {
+    HMPMigrationStatus *status = g_malloc0(sizeof(*status));
+    status->mon = NULL;
+    status->is_block_migration = false;
+    status->timer = timer_new_ms(QEMU_CLOCK_REALTIME, hmp_migrate_status_cb,
+                                 status);
+    timer_mod(status->timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME));
+}
+
 void hmp_migrate(Monitor *mon, const QDict *qdict)
 {
     bool detach = qdict_get_try_bool(qdict, "detach", false);
     bool blk = qdict_get_try_bool(qdict, "blk", false);
     bool inc = qdict_get_try_bool(qdict, "inc", false);
+    int period = qdict_get_try_int(qdict, "period", 0);
     bool resume = qdict_get_try_bool(qdict, "resume", false);
     const char *uri = qdict_get_str(qdict, "uri");
     Error *err = NULL;
 
-    qmp_migrate(uri, !!blk, blk, !!inc, inc,
-                false, false, true, resume, &err);
+    qmp_migrate(uri, !!blk, blk, !!inc, inc, false, false, !!period, period,
+                !!resume, resume, &err);
     if (err) {
         hmp_handle_error(mon, &err);
         return;

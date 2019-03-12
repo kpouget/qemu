@@ -1,28 +1,38 @@
-before_script:
- - apt-get update -qq
- - apt-get install -y -qq flex bison libglib2.0-dev libpixman-1-dev genisoimage
+stages:
+  - arm64-build
+  - qemu-upstream-CI
 
-build-system1:
+.docker_job: &docker_job
+   variables:
+     GIT_SUBMODULE_STRATEGY: recursive
+     GIT_SSL_NO_VERIFY: 'true'
+   image: kpouget/qemu-aarch64:latest
+   tags:
+     - docker
+
+.build-system1:
+ <<: *docker_job
+ stage: qemu-upstream-CI
  script:
- - apt-get install -y -qq libgtk-3-dev libvte-dev nettle-dev libcacard-dev
-      libusb-dev libvde-dev libspice-protocol-dev libgl1-mesa-dev
  - ./configure --enable-werror --target-list="aarch64-softmmu alpha-softmmu
       cris-softmmu hppa-softmmu lm32-softmmu moxie-softmmu microblazeel-softmmu
       mips64el-softmmu m68k-softmmu ppc-softmmu riscv64-softmmu sparc-softmmu"
  - make -j2
  - make -j2 check
 
-build-system2:
+.build-system2:
+ <<: *docker_job
+ stage: qemu-upstream-CI
  script:
- - apt-get install -y -qq libsdl2-dev libgcrypt-dev libbrlapi-dev libaio-dev
-      libfdt-dev liblzo2-dev librdmacm-dev libibverbs-dev libibumad-dev
  - ./configure --enable-werror --target-list="tricore-softmmu unicore32-softmmu
       microblaze-softmmu mips-softmmu riscv32-softmmu s390x-softmmu sh4-softmmu
       sparc64-softmmu x86_64-softmmu xtensa-softmmu nios2-softmmu or1k-softmmu"
  - make -j2
  - make -j2 check
 
-build-disabled:
+.build-disabled:
+ <<: *docker_job
+ stage: qemu-upstream-CI
  script:
  - ./configure --enable-werror --disable-rdma --disable-slirp --disable-curl
       --disable-capstone --disable-live-block-migration --disable-glusterfs
@@ -34,9 +44,10 @@ build-disabled:
  - make -j2
  - make -j2 check-qtest SPEED=slow
 
-build-tcg-disabled:
+.build-tcg-disabled:
+ <<: *docker_job
+ stage: qemu-upstream-CI
  script:
- - apt-get install -y -qq clang libgtk-3-dev libbluetooth-dev libusb-dev
  - ./configure --cc=clang --enable-werror --disable-tcg --audio-drv-list=""
  - make -j2
  - make check-unit
@@ -55,19 +66,32 @@ build-tcg-disabled:
             161 165 170 172 174 176 177 179 184 186 187 190 192 194 195 196
             197 200 202 203 205 208 209 214 215 216 217 218 222 226 227 229 234
 
-build-user:
+.build-user:
+ <<: *docker_job
+ stage: qemu-upstream-CI
  script:
  - ./configure --enable-werror --disable-system --disable-guest-agent
                --disable-capstone --disable-slirp --disable-fdt
  - make -j2
  - make run-tcg-tests-i386-linux-user run-tcg-tests-x86_64-linux-user
 
-build-clang:
+.build-clang:
+ <<: *docker_job
+ stage: qemu-upstream-CI
  script:
- - apt-get install -y -qq clang libsdl2-dev
-      xfslibs-dev libiscsi-dev libnfs-dev libseccomp-dev gnutls-dev librbd-dev
  - ./configure --cc=clang --cxx=clang++ --enable-werror
       --target-list="alpha-softmmu arm-softmmu m68k-softmmu mips64-softmmu
                      ppc-softmmu s390x-softmmu x86_64-softmmu arm-linux-user"
  - make -j2
  - make -j2 check
+
+
+build:qemu:
+  <<: *docker_job
+  before_script:
+    - make -C dtc clean
+  stage: arm64-build
+  script:
+    - mkdir -p build && cd build
+    - ../configure --target-list=aarch64-softmmu --disable-libusb --disable-sdl --disable-seccomp --disable-numa --disable-spice --disable-libssh2 --disable-tcmalloc --disable-glusterfs --disable-seccomp --disable-{bzip2,snappy,lzo} --disable-usb-redir --disable-libusb --disable-libnfs --disable-tcg-interpreter --disable-debug-tcg --disable-libiscsi --disable-rbd --disable-spice --disable-attr --disable-cap-ng --disable-linux-aio --disable-brlapi --disable-vnc-{jpeg,png,sasl} --disable-rdma --disable-bluez --disable-curl --disable-curses --disable-sdl --disable-gtk --disable-tpm --disable-vte --disable-vnc --disable-xen --disable-opengl --disable-slirp --disable-capstone --cross-prefix=aarch64-linux-gnu-
+    - make  -j2

@@ -50,7 +50,8 @@ bool multifd_recv_all_channels_created(void);
 bool multifd_recv_new_channel(QIOChannel *ioc, Error **errp);
 
 uint64_t ram_pagesize_summary(void);
-int ram_save_queue_pages(const char *rbname, ram_addr_t start, ram_addr_t len, bool copy_pages);
+int ram_save_queue_pages(const char *rbname, ram_addr_t start, ram_addr_t len,
+                         bool copy_pages, bool to_priority_queue, bool to_next_dirty_queue);
 void acct_update_position(QEMUFile *f, size_t size, bool zero);
 void ram_debug_dump_bitmap(unsigned long *todump, bool expected,
                            unsigned long pages);
@@ -62,6 +63,11 @@ int ram_discard_range(const char *block_name, uint64_t start, size_t length);
 int ram_postcopy_incoming_init(MigrationIncomingState *mis);
 
 void ram_handle_compressed(void *host, uint8_t ch, uint64_t size);
+int ram_checksum_memory(void);
+bool ram_update_page_in_queue(const char *rbname, ram_addr_t offset, ram_addr_t size);
+void ram_next_dirty_pages_to_priority_queue(void);
+
+void ram_page_req_mutex(bool lock);
 
 int ramblock_recv_bitmap_test(RAMBlock *rb, void *host_addr);
 bool ramblock_recv_bitmap_test_byte_offset(RAMBlock *rb, uint64_t byte_offset);
@@ -74,5 +80,12 @@ int ram_dirty_bitmap_reload(MigrationState *s, RAMBlock *rb);
 /* ram cache */
 int colo_init_ram_cache(void);
 void colo_release_ram_cache(void);
+
+void snapshot_bitmap_reset_all_dirty(void);
+bool snapshot_bitmap_dirty(RAMBlock *rb, ram_addr_t addr, int val);
+bool snapshot_bitmap_sent(RAMBlock *rb, ram_addr_t addr, int val);
+bool snapshot_bitmap_processing_lock_host_page(RAMBlock *rb, ram_addr_t addr);
+bool snapshot_bitmap_processing_unlock_host_page(RAMBlock *rb, ram_addr_t addr);
+void snapshot_bitmap_reset_sent(RAMBlock *rb, long val);
 
 #endif
